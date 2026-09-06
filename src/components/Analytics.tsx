@@ -352,6 +352,84 @@ const Analytics: React.FC<AnalyticsProps> = ({
         </div>
       </div>
 
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Topic Hits Distribution */}
+        <div className={`border p-6 rounded-[2.5rem] space-y-6 transition-colors duration-500 relative overflow-hidden group ${darkMode ? 'bg-cyan-950/20 border-cyan-500/10 glow-cyan' : 'bg-white border-slate-100 shadow-xl shadow-slate-100/5'}`}>
+          <div className="flex items-center space-x-2">
+            <div className={`p-1.5 rounded-lg ${darkMode ? 'bg-cyan-500/20 text-cyan-400' : 'bg-cyan-500/10 text-cyan-600'}`}>
+              <Layers size={14} />
+            </div>
+            <h3 className={`text-[10px] font-black uppercase tracking-widest ${darkMode ? 'text-cyan-400' : 'text-cyan-600'}`}>Topic Hit Distribution</h3>
+          </div>
+
+          <div className="space-y-4">
+            {data.topicData.length > 0 ? (
+              data.topicData.map((topic, i) => {
+                const maxVal = Math.max(...data.topicData.map(t => t.value), 1);
+                const percent = Math.round((topic.value / maxVal) * 100);
+                return (
+                  <div key={topic.name} className="space-y-1.5">
+                    <div className="flex items-center justify-between text-xs font-bold">
+                      <span className={darkMode ? 'text-slate-300' : 'text-slate-700'}>{topic.name}</span>
+                      <span className="text-cyan-500">{topic.value} hits</span>
+                    </div>
+                    <div className={`w-full h-2 rounded-full overflow-hidden ${darkMode ? 'bg-neutral-800' : 'bg-slate-100'}`}>
+                      <motion.div 
+                        initial={{ width: 0 }}
+                        animate={{ width: `${percent}%` }}
+                        transition={{ duration: 0.8, delay: i * 0.1 }}
+                        className="h-full bg-gradient-to-r from-cyan-500 to-blue-500 rounded-full"
+                      />
+                    </div>
+                  </div>
+                );
+              })
+            ) : (
+              <div className="text-xs text-center py-6 opacity-50">No topic hit logs recorded yet. Match bots to topics to see statistics.</div>
+            )}
+          </div>
+        </div>
+
+        {/* Keyword Trigger Frequency */}
+        <div className={`border p-6 rounded-[2.5rem] space-y-6 transition-colors duration-500 relative overflow-hidden group ${darkMode ? 'bg-violet-950/20 border-violet-500/10 glow-violet' : 'bg-white border-slate-100 shadow-xl shadow-slate-100/5'}`}>
+          <div className="flex items-center space-x-2">
+            <div className={`p-1.5 rounded-lg ${darkMode ? 'bg-violet-500/20 text-violet-400' : 'bg-violet-500/10 text-violet-600'}`}>
+              <TrendingUp size={14} />
+            </div>
+            <h3 className={`text-[10px] font-black uppercase tracking-widest ${darkMode ? 'text-violet-400' : 'text-violet-600'}`}>Keyword Trigger Frequency</h3>
+          </div>
+
+          <div className="space-y-4">
+            {data.keywordData.length > 0 ? (
+              data.keywordData.map((kw, i) => {
+                const maxVal = Math.max(...data.keywordData.map(k => k.value), 1);
+                const percent = Math.round((kw.value / maxVal) * 100);
+                return (
+                  <div key={kw.name} className="space-y-1.5">
+                    <div className="flex items-center justify-between text-xs font-bold">
+                      <span className={`px-2 py-0.5 rounded-md text-[10px] font-mono ${darkMode ? 'bg-violet-500/10 text-violet-300 border border-violet-500/20' : 'bg-violet-50 text-violet-600 border border-violet-200'}`}>
+                        "{kw.name}"
+                      </span>
+                      <span className="text-violet-500">{kw.value} triggers</span>
+                    </div>
+                    <div className={`w-full h-2 rounded-full overflow-hidden ${darkMode ? 'bg-neutral-800' : 'bg-slate-100'}`}>
+                      <motion.div 
+                        initial={{ width: 0 }}
+                        animate={{ width: `${percent}%` }}
+                        transition={{ duration: 0.8, delay: i * 0.1 }}
+                        className="h-full bg-gradient-to-r from-violet-500 to-fuchsia-500 rounded-full"
+                      />
+                    </div>
+                  </div>
+                );
+              })
+            ) : (
+              <div className="text-xs text-center py-6 opacity-50">No keyword triggers logged yet. Match rules to see metrics.</div>
+            )}
+          </div>
+        </div>
+      </div>
+
       {/* Detailed Breakdown List */}
       <div className={`border p-6 rounded-[2.5rem] relative overflow-hidden transition-all duration-500 ${darkMode ? 'bg-neutral-900 border-white/5' : 'bg-white border-slate-100 shadow-lg shadow-slate-100/5'}`}>
         <div className="flex items-center space-x-2 mb-6">

@@ -1,8 +1,9 @@
 import React, { memo, useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Bot, Zap, Plus, Trash2, CheckCircle2, Image as ImageIcon, Bell, Send, Database, Download, Upload, Save, RefreshCw, FileText, Eye, EyeOff, ExternalLink, Sparkles, Smartphone } from 'lucide-react';
+import { Bot, Zap, Plus, Trash2, CheckCircle2, Image as ImageIcon, Bell, Send, Database, Download, Upload, Save, RefreshCw, FileText, Eye, EyeOff, ExternalLink, Sparkles, Smartphone, FileJson, History, Calendar, Globe, Copy, Check } from 'lucide-react';
 import ActivityLogs from './ActivityLogs';
 import { LOGO_PRESETS } from './LogoSelectorModal';
+import { getDeviceInfo, pingDeviceSession } from '../utils/deviceTracker';
 
 interface SettingsPanelProps {
   darkMode: boolean;
@@ -63,6 +64,21 @@ interface SettingsPanelProps {
   fileInputRef: React.RefObject<HTMLInputElement>;
   handleImportData: (e: React.ChangeEvent<HTMLInputElement>) => void;
   importing: boolean;
+  onOpenDeleteLastImport?: () => void;
+  onOpenDeleteLastRule?: () => void;
+  lastImportInfo?: { hasLastImport: boolean; count: number; importedAt: string | null; latestRuleName?: string; totalRules?: number } | null;
+  importBatches?: Array<{
+    id: string;
+    batchId: string;
+    fileName: string;
+    importedAt: string;
+    count: number;
+    names: string[];
+  }>;
+  onDeleteBatch?: (batch: { batchId: string; fileName: string; count: number }) => void;
+  isFetchingBatches?: boolean;
+  deletingBatchId?: string | null;
+  onRefreshBatches?: () => void;
   targetGroupId: string;
   setTargetGroupId: (val: string) => void;
   telegramBotToken: string;
@@ -157,6 +173,14 @@ const SettingsPanel: React.FC<SettingsPanelProps> = ({
   fileInputRef,
   handleImportData,
   importing,
+  onOpenDeleteLastImport,
+  onOpenDeleteLastRule,
+  lastImportInfo,
+  importBatches = [],
+  onDeleteBatch,
+  isFetchingBatches = false,
+  deletingBatchId = null,
+  onRefreshBatches,
   targetGroupId,
   setTargetGroupId,
   telegramBotToken,
@@ -193,6 +217,27 @@ const SettingsPanel: React.FC<SettingsPanelProps> = ({
   const [settingsSubTab, setSettingsSubTab] = useState<'settings' | 'logs'>('settings');
   const [showToken, setShowToken] = useState(false);
   const [botInfo, setBotInfo] = useState<{ id: number; firstName: string; username: string } | null>(null);
+
+  // Unique IP & Device Tracking state
+  const [userIp, setUserIp] = useState<string>('Detecting...');
+  const [deviceId, setDeviceId] = useState<string>('');
+  const [deviceName, setDeviceName] = useState<string>('');
+  const [copiedIp, setCopiedIp] = useState(false);
+
+  useEffect(() => {
+    const info = getDeviceInfo();
+    setDeviceId(info.deviceId);
+    setDeviceName(info.deviceName);
+    pingDeviceSession().then(res => {
+      if (res && res.ip) {
+        setUserIp(res.ip);
+      } else {
+        setUserIp('Connected');
+      }
+    }).catch(() => {
+      setUserIp('Connected');
+    });
+  }, []);
 
   useEffect(() => {
     const fetchBotInfo = async () => {
@@ -281,6 +326,54 @@ const SettingsPanel: React.FC<SettingsPanelProps> = ({
         </div>
       ) : (
         <>
+      {/* Unique IP Address & Device Tracking Card */}
+      <div className={`p-4 rounded-xl border transition-all duration-300 ${darkMode ? 'bg-neutral-900/60 border-white/10' : 'bg-white border-slate-200 shadow-xs'}`}>
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center space-x-2">
+            <div className={`p-1.5 rounded-lg ${darkMode ? 'bg-indigo-500/10 text-indigo-400' : 'bg-indigo-50 text-indigo-600'}`}>
+              <Globe size={15} />
+            </div>
+            <div>
+              <h3 className={`text-[11px] font-bold uppercase tracking-wider ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>
+                Your Unique IP Address & Device
+              </h3>
+              <p className="text-[9.5px] text-slate-400">Active hardware fingerprint & session IP tracing</p>
+            </div>
+          </div>
+          <span className="px-2 py-0.5 rounded-full text-[8.5px] font-black uppercase tracking-wider bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 flex items-center gap-1">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
+            LIVE
+          </span>
+        </div>
+
+        <div className={`p-3 rounded-xl border flex items-center justify-between ${darkMode ? 'bg-black/30 border-white/10' : 'bg-slate-50 border-slate-200'}`}>
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <span className="text-[9px] uppercase font-bold text-slate-400 tracking-wider">Your IP Address:</span>
+              <span className="text-xs font-mono font-bold text-emerald-400">{userIp}</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-[9px] uppercase font-bold text-slate-400 tracking-wider">Device ID:</span>
+              <span className="text-[10px] font-mono text-slate-300 truncate max-w-[200px]">{deviceId}</span>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              navigator.clipboard.writeText(`IP: ${userIp} | Device ID: ${deviceId} | Device: ${deviceName}`);
+              setCopiedIp(true);
+              setTimeout(() => setCopiedIp(false), 2000);
+            }}
+            className={`px-3 py-2 rounded-lg text-xs font-bold flex items-center gap-1.5 transition ${
+              darkMode ? 'bg-indigo-600/20 text-indigo-300 hover:bg-indigo-600/40 border border-indigo-500/30' : 'bg-indigo-100 text-indigo-700 hover:bg-indigo-200'
+            }`}
+          >
+            {copiedIp ? <Check size={13} className="text-emerald-400" /> : <Copy size={13} />}
+            <span>{copiedIp ? 'Copied!' : 'Copy Info'}</span>
+          </button>
+        </div>
+      </div>
+
       {/* App Logo & Visual Branding Card */}
       <div className={`p-4 rounded-xl border transition-all duration-300 ${darkMode ? 'bg-neutral-900/60 border-white/10' : 'bg-white border-slate-200 shadow-xs'}`}>
         <div className="flex items-center justify-between mb-3.5">
@@ -992,6 +1085,7 @@ const SettingsPanel: React.FC<SettingsPanelProps> = ({
         
         <div className="grid grid-cols-2 gap-3">
           <button 
+            type="button"
             onClick={handleExportData}
             className={`flex flex-col items-center justify-center space-y-1 py-3 px-2 rounded-lg border transition ${darkMode ? 'bg-black/20 border-white/10 text-slate-300 hover:bg-black/30' : 'bg-slate-50 border-slate-150 text-slate-600 hover:bg-white shadow-xs'}`}
           >
@@ -999,6 +1093,7 @@ const SettingsPanel: React.FC<SettingsPanelProps> = ({
             <span className="text-[9px] font-bold uppercase tracking-wider">Export Data</span>
           </button>
           <button 
+            type="button"
             onClick={() => fileInputRef.current?.click()}
             disabled={importing}
             className={`flex flex-col items-center justify-center space-y-1 py-3 px-2 rounded-lg border transition ${darkMode ? 'bg-black/20 border-white/10 text-slate-300 hover:bg-black/30' : 'bg-slate-50 border-slate-150 text-slate-600 hover:bg-white shadow-xs'}`}
@@ -1007,7 +1102,165 @@ const SettingsPanel: React.FC<SettingsPanelProps> = ({
             <span className="text-[9px] font-bold uppercase tracking-wider">{importing ? 'Importing...' : 'Import Data'}</span>
           </button>
           <input type="file" ref={fileInputRef} onChange={handleImportData} accept=".json" className="hidden" />
+
+          {onOpenDeleteLastImport && (
+            <button
+              type="button"
+              onClick={onOpenDeleteLastImport}
+              className={`col-span-2 sm:col-span-1 flex items-center justify-center space-x-2 py-2.5 px-2.5 rounded-lg border text-[10px] font-bold uppercase tracking-wider transition ${
+                darkMode
+                  ? 'bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border-rose-500/20'
+                  : 'bg-rose-50 hover:bg-rose-100 text-rose-600 border-rose-200'
+              } active:scale-98`}
+              title="Delete all rules imported in the last JSON file at once"
+            >
+              <Trash2 size={13} className="text-rose-500 shrink-0" />
+              <span className="truncate">
+                {lastImportInfo && lastImportInfo.count > 0 
+                  ? `Delete Last JSON (${lastImportInfo.count} Rules)` 
+                  : 'Delete Last Imported JSON'}
+              </span>
+            </button>
+          )}
+
+          {onOpenDeleteLastRule && (
+            <button
+              type="button"
+              onClick={onOpenDeleteLastRule}
+              className={`col-span-2 sm:col-span-1 flex items-center justify-center space-x-2 py-2.5 px-2.5 rounded-lg border text-[10px] font-bold uppercase tracking-wider transition ${
+                darkMode
+                  ? 'bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border-amber-500/20'
+                  : 'bg-amber-50 hover:bg-amber-100 text-amber-700 border-amber-200'
+              } active:scale-98`}
+              title="Delete only the single latest rule (1 by 1)"
+            >
+              <Trash2 size={13} className="text-amber-500 shrink-0" />
+              <span className="truncate">
+                {lastImportInfo?.latestRuleName 
+                  ? `Delete Last 1 Rule ("${lastImportInfo.latestRuleName.slice(0, 10)}${lastImportInfo.latestRuleName.length > 10 ? '...' : ''}")` 
+                  : 'Delete Last 1 Rule'}
+              </span>
+            </button>
+          )}
         </div>
+      </div>
+
+      {/* Past Imported Files History Card */}
+      <div className={`p-4 rounded-xl border transition duration-300 ${darkMode ? 'bg-neutral-900/60 border-white/10' : 'bg-white border-slate-200 shadow-xs'}`}>
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center space-x-2">
+            <div className={`p-1.5 rounded-lg ${darkMode ? 'bg-indigo-500/10 text-indigo-400' : 'bg-indigo-50 text-indigo-600'}`}>
+              <History size={15} />
+            </div>
+            <div>
+              <h3 className={`text-[11px] font-bold uppercase tracking-wider ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>
+                Imported Files History
+              </h3>
+              <p className="text-[10px] text-slate-400">Past imported JSON backup files & rule batches</p>
+            </div>
+          </div>
+          {onRefreshBatches && (
+            <button
+              type="button"
+              onClick={onRefreshBatches}
+              disabled={isFetchingBatches}
+              className={`p-1.5 rounded-lg border transition ${
+                darkMode ? 'bg-black/20 border-white/10 text-slate-400 hover:text-white' : 'bg-slate-50 border-slate-200 text-slate-600 hover:text-slate-900'
+              }`}
+              title="Refresh imported files list"
+            >
+              <RefreshCw size={13} className={isFetchingBatches ? 'animate-spin text-indigo-400' : ''} />
+            </button>
+          )}
+        </div>
+
+        {importBatches && importBatches.length > 0 ? (
+          <div className="space-y-2.5 max-h-[320px] overflow-y-auto pr-1">
+            {importBatches.map((batch) => (
+              <div
+                key={batch.batchId || batch.id}
+                className={`p-3 rounded-xl border transition flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+                  darkMode 
+                    ? 'bg-neutral-800/40 border-neutral-700/60 hover:bg-neutral-800/60' 
+                    : 'bg-slate-50/80 border-slate-200/80 hover:bg-slate-100/60 shadow-xs'
+                }`}
+              >
+                <div className="flex items-start space-x-2.5 min-w-0 flex-1">
+                  <div className={`p-2 rounded-lg shrink-0 mt-0.5 ${
+                    darkMode ? 'bg-indigo-500/15 text-indigo-400 border border-indigo-500/20' : 'bg-indigo-100 text-indigo-700 border border-indigo-200'
+                  }`}>
+                    <FileJson size={16} />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center space-x-2 flex-wrap gap-y-1">
+                      <span className={`text-xs font-bold truncate max-w-[200px] sm:max-w-[260px] ${darkMode ? 'text-white' : 'text-slate-900'}`} title={batch.fileName}>
+                        {batch.fileName}
+                      </span>
+                      <span className={`text-[10px] font-black px-2 py-0.5 rounded-full border ${
+                        darkMode ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30' : 'bg-emerald-100 text-emerald-800 border-emerald-200'
+                      }`}>
+                        {batch.count} Rules
+                      </span>
+                    </div>
+
+                    <div className="flex items-center space-x-2 text-[10px] text-slate-400 mt-1">
+                      <Calendar size={11} className="shrink-0 text-slate-500" />
+                      <span>{new Date(batch.importedAt).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
+                    </div>
+
+                    {batch.names && batch.names.length > 0 && (
+                      <div className="flex items-center space-x-1.5 mt-2 flex-wrap gap-y-1">
+                        {batch.names.slice(0, 4).map((name, idx) => (
+                          <span key={idx} className={`text-[9px] px-1.5 py-0.5 rounded-md font-mono ${
+                            darkMode ? 'bg-black/40 text-slate-300 border border-white/5' : 'bg-white text-slate-600 border border-slate-200'
+                          }`}>
+                            "{name.slice(0, 15)}{name.length > 15 ? '...' : ''}"
+                          </span>
+                        ))}
+                        {batch.names.length > 4 && (
+                          <span className="text-[9px] text-slate-400">+{batch.names.length - 4} more</span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Side Delete Button */}
+                <div className="flex sm:flex-col justify-end shrink-0">
+                  <button
+                    type="button"
+                    disabled={deletingBatchId === batch.batchId}
+                    onClick={() => onDeleteBatch && onDeleteBatch({ batchId: batch.batchId, fileName: batch.fileName, count: batch.count })}
+                    className={`flex items-center justify-center space-x-1.5 py-2 px-3 rounded-lg border text-[11px] font-bold uppercase tracking-wider transition ${
+                      darkMode
+                        ? 'bg-rose-500/15 hover:bg-rose-500/25 text-rose-400 border-rose-500/30'
+                        : 'bg-rose-50 hover:bg-rose-100 text-rose-600 border-rose-200'
+                    } active:scale-95 disabled:opacity-50`}
+                    title={`Delete "${batch.fileName}" and remove its ${batch.count} rules`}
+                  >
+                    {deletingBatchId === batch.batchId ? (
+                      <>
+                        <RefreshCw size={12} className="animate-spin text-rose-400" />
+                        <span>Deleting...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Trash2 size={13} className="text-rose-500 shrink-0" />
+                        <span>Delete</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className={`p-4 rounded-xl border text-center ${darkMode ? 'bg-neutral-800/20 border-neutral-800/80 text-slate-400' : 'bg-slate-50 border-slate-200 text-slate-500'}`}>
+            <FileJson size={22} className="mx-auto mb-1.5 opacity-40 text-indigo-400" />
+            <p className="text-xs font-semibold">No past imported files found</p>
+            <p className="text-[10px] opacity-75 mt-0.5">When you import JSON backup files, they will be listed here with individual delete buttons.</p>
+          </div>
+        )}
       </div>
 
       {/* System Update & Cache Maintenance Card */}
@@ -1052,34 +1305,27 @@ const SettingsPanel: React.FC<SettingsPanelProps> = ({
 
       </>
       )}
-      {/* Save Button - cleanly docked at bottom of settings */}
+      {/* Save Button - GORGEOUS FLOATING ACTION BUTTON (FAB) */}
       {settingsSubTab === 'settings' && (
-        <div className="pt-6 pb-6 sticky bottom-16 sm:bottom-20 z-30">
-          <div className={`p-3.5 rounded-2xl border backdrop-blur-xl shadow-2xl flex items-center justify-between gap-3 ${darkMode ? 'bg-neutral-950/95 border-white/15' : 'bg-white/95 border-slate-200 shadow-emerald-500/10'}`}>
-            <div className="flex flex-col pl-1 min-w-0">
-              <span className={`text-[11px] font-black uppercase tracking-wider truncate ${darkMode ? 'text-white' : 'text-slate-900'}`}>
-                Configuration
-              </span>
-              <span className="text-[10px] text-slate-400 truncate">
-                Save your changes for this account
-              </span>
-            </div>
-            <motion.button
-              whileHover={{ scale: 1.02 }}
-              whileTap={{ scale: 0.97 }}
-              onClick={handleUpdateSettings}
-              disabled={saving}
-              className={`py-2.5 px-5 rounded-xl font-black uppercase tracking-wider text-xs transition-all shadow-lg flex items-center justify-center space-x-2 shrink-0 ${darkMode ? 'bg-gradient-to-r from-emerald-500 to-teal-600 text-white shadow-emerald-950/50 hover:brightness-110' : 'bg-gradient-to-r from-emerald-500 to-teal-600 text-white shadow-emerald-500/25 hover:brightness-105'}`}
-            >
-              {saving ? (
-                <RefreshCw className="animate-spin" size={14} />
-              ) : (
-                <Save size={14} />
-              )}
-
-              <span>{saving ? 'Saving...' : 'Save Settings'}</span>
-            </motion.button>
-          </div>
+        <div className="fixed bottom-24 right-4 sm:right-6 md:right-8 z-45">
+          <motion.button
+            whileHover={{ scale: 1.05, y: -2 }}
+            whileTap={{ scale: 0.95 }}
+            onClick={handleUpdateSettings}
+            disabled={saving}
+            className={`py-3 px-5 rounded-full font-black uppercase tracking-widest text-[11px] transition-all shadow-2xl flex items-center justify-center space-x-2 shrink-0 border ${
+              darkMode 
+                ? 'bg-gradient-to-r from-emerald-400 via-emerald-500 to-teal-600 text-slate-950 border-emerald-400/20 shadow-emerald-500/20 hover:brightness-110' 
+                : 'bg-gradient-to-r from-emerald-500 via-emerald-600 to-teal-600 text-white border-emerald-600/20 shadow-emerald-600/30 hover:brightness-105'
+            }`}
+          >
+            {saving ? (
+              <RefreshCw className="animate-spin" size={15} />
+            ) : (
+              <Save size={15} className="animate-pulse" />
+            )}
+            <span>{saving ? 'Saving...' : 'Save Settings'}</span>
+          </motion.button>
         </div>
       )}
     </motion.div>

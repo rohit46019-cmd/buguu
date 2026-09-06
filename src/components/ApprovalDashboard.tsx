@@ -152,7 +152,7 @@ const ApprovalDashboard: React.FC<ApprovalDashboardProps> = ({ darkMode, directi
                         </span>
                       </div>
                       <p className={`text-[11px] font-bold ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}>
-                        {approval.chat_title || 'Group'} <span className="text-slate-400 mx-1">/</span> {approval.topic_name || 'Topic'}
+                        {approval.chat_title && approval.chat_title !== 'Telegram Group' ? approval.chat_title : 'Telegram Group'} <span className="text-slate-400 mx-1">/</span> {approval.topic_name && approval.topic_name !== 'General' && approval.topic_name !== 'Topic' ? approval.topic_name : (approval.topic_id ? `Topic #${approval.topic_id}` : 'General')}
                       </p>
                     </div>
 

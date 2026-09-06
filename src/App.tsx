@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useDeferredValue, useMemo, useCallback } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { Toaster, toast } from 'react-hot-toast';
+import { apiFetch, apiJson, invalidateApiCache } from './lib/api';
 import { Skeleton } from './components/Skeleton';
 import Dashboard from './components/Dashboard';
 import KeywordsManager from './components/KeywordsManager';
@@ -21,6 +22,7 @@ import ApprovalDashboard from './components/ApprovalDashboard';
 import ProfileSelector from './components/ProfileSelector';
 import { LogoSelectorModal } from './components/LogoSelectorModal';
 import { InstallAppModal } from './components/InstallAppModal';
+import { pingDeviceSession } from './utils/deviceTracker';
 import { 
   MessageSquare, 
   LayoutGrid,
@@ -328,7 +330,112 @@ export function useCachedState<T>(key: string, defaultValue: T): [T, React.Dispa
   return [state, setState];
 }
 
+// Global fetch interceptor to inject x-account-id automatically for all API requests
+if (typeof window !== "undefined") {
+  try {
+    const originalFetch = window.fetch;
+    const customFetch = async function (input: any, init: any) {
+      const activeAccId = localStorage.getItem('currentProfileId') || localStorage.getItem('activeAccountId') || 'default';
+      let url = typeof input === 'string' ? input : (input instanceof Request ? input.url : '');
+      if (url.startsWith('/api') || url.includes('/api/')) {
+        init = init || {};
+        if (input instanceof Request) {
+          try {
+            if (!input.headers.has('x-account-id')) {
+              input.headers.set('x-account-id', activeAccId);
+            }
+          } catch (e) {
+            // If Request headers are read-only or immutable, clone the Request with the header
+            try {
+              const newHeaders = new Headers(input.headers);
+              newHeaders.set('x-account-id', activeAccId);
+              input = new Request(input, { headers: newHeaders });
+            } catch (err) {}
+          }
+        } else {
+          const headers = init.headers || {};
+          if (headers instanceof Headers) {
+            if (!headers.has('x-account-id')) {
+              headers.set('x-account-id', activeAccId);
+            }
+            init.headers = headers;
+          } else if (Array.isArray(headers)) {
+            const hasHeader = headers.some(([k]) => k.toLowerCase() === 'x-account-id');
+            if (!hasHeader) {
+              headers.push(['x-account-id', activeAccId]);
+            }
+            init.headers = headers;
+          } else if (typeof headers === 'object') {
+            const hasHeader = Object.keys(headers).some(k => k.toLowerCase() === 'x-account-id');
+            if (!hasHeader) {
+              (headers as any)['x-account-id'] = activeAccId;
+            }
+            init.headers = headers;
+          }
+        }
+      }
+      return originalFetch(input, init);
+    };
+
+    try {
+      window.fetch = customFetch;
+    } catch (assignError) {
+      Object.defineProperty(window, 'fetch', {
+        value: customFetch,
+        writable: true,
+        configurable: true
+      });
+    }
+  } catch (err) {
+    console.warn("Failed to intercept window.fetch globally, proceeding safely.", err);
+  }
+}
+
 export default function App() {
+  const [currentProfileId, setCurrentProfileId] = useState(() => localStorage.getItem('currentProfileId') || 'default');
+
+  useEffect(() => {
+    let deviceId = localStorage.getItem('botflow_device_id');
+    if (!deviceId) {
+      deviceId = 'dev_' + Math.random().toString(36).substring(2, 11) + '_' + Date.now().toString(36);
+      localStorage.setItem('botflow_device_id', deviceId);
+    }
+
+    const sendHeartbeat = async () => {
+      try {
+        const activeAcc = localStorage.getItem('currentProfileId') || 'default';
+        await fetch('/api/device/heartbeat', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-account-id': activeAcc,
+            'x-device-id': deviceId!
+          },
+          body: JSON.stringify({
+            deviceId,
+            accountId: activeAcc
+          })
+        }).catch(() => {});
+      } catch (e) {}
+    };
+
+    sendHeartbeat();
+    const heartbeatInterval = setInterval(sendHeartbeat, 30000);
+
+    const handleAccountChanged = (e: any) => {
+      const newId = e.detail?.accountId || 'default';
+      setCurrentProfileId(newId);
+      sendHeartbeat();
+      // Re-register push subscription for the switched account
+      subscribeToPush(true);
+    };
+    window.addEventListener('account_changed', handleAccountChanged);
+    return () => {
+      clearInterval(heartbeatInterval);
+      window.removeEventListener('account_changed', handleAccountChanged);
+    };
+  }, []);
+
   const [stats, setStats] = useCachedState<Stats | null>("botflow_stats", null);
   const [targetGroupId, setTargetGroupId] = useCachedState("botflow_targetGroupId", "");
   const [telegramBotToken, setTelegramBotToken] = useCachedState("botflow_telegramBotToken", "");
@@ -393,6 +500,10 @@ export default function App() {
   const [testReply, setTestReply] = useState("");
   const [isTesting, setIsTesting] = useState(false);
   const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const [aiSuggestions, setAiSuggestions] = useState<any[]>([]);
+  const [isGeneratingSuggestions, setIsGeneratingSuggestions] = useState(false);
+  const [aiSuggestionsError, setAiSuggestionsError] = useState("");
+  const [addedSuggestions, setAddedSuggestions] = useState<string[]>([]);
   const [mediaItems, setMediaItems] = useState<MediaItem[]>([]);
   const [userLeaderboard, setUserLeaderboard] = useState<LeaderboardItem[]>([]);
   const [activityHeatmap, setActivityHeatmap] = useState<HeatmapItem[]>([]);
@@ -423,6 +534,21 @@ export default function App() {
   const [showPauseConfirmation, setShowPauseConfirmation] = useState(false);
   const [showClearDataConfirm, setShowClearDataConfirm] = useState(false);
   const [showDeleteLastKeywordConfirm, setShowDeleteLastKeywordConfirm] = useState(false);
+  const [showDeleteLastRuleConfirm, setShowDeleteLastRuleConfirm] = useState(false);
+  const [lastImportInfo, setLastImportInfo] = useState<{ hasLastImport: boolean; count: number; importedAt: string | null; names?: string[]; latestRuleName?: string; totalRules?: number } | null>(null);
+  const [importBatches, setImportBatches] = useState<Array<{
+    id: string;
+    batchId: string;
+    fileName: string;
+    importedAt: string;
+    count: number;
+    names: string[];
+  }>>([]);
+  const [isFetchingBatches, setIsFetchingBatches] = useState(false);
+  const [batchToDelete, setBatchToDelete] = useState<{ batchId: string; fileName: string; count: number } | null>(null);
+  const [deletingBatchId, setDeletingBatchId] = useState<string | null>(null);
+  const [deletingLastImport, setDeletingLastImport] = useState(false);
+  const [deletingLastRule, setDeletingLastRule] = useState(false);
   const [showResetKeywordsConfirm, setShowResetKeywordsConfirm] = useState(false);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
   const [isSearchFocused, setIsSearchFocused] = useState(false);
@@ -680,14 +806,9 @@ export default function App() {
 
   const fetchBlockedTopics = React.useCallback(async () => {
     try {
-      const response = await fetch('/api/blocked-topics');
-      const text = await response.text();
-      if (text.includes("Rate exceeded")) return;
-      try {
-        const data = JSON.parse(text);
-        setBlockedTopics(data);
-      } catch (e) {
-        console.error("Failed to parse blocked topics JSON:", text);
+      const res = await apiJson('/api/blocked-topics');
+      if (res.ok && Array.isArray(res.data)) {
+        setBlockedTopics(res.data);
       }
     } catch (err: any) {
       if (err.message !== "Failed to fetch") {
@@ -700,34 +821,22 @@ export default function App() {
     if (!newBlockedTopicLink) return;
     setBlockingTopic(true);
     try {
-      const response = await fetch('/api/blocked-topics', {
+      const res = await apiFetch('/api/blocked-topics', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ link: newBlockedTopicLink }),
       });
       
-      const text = await response.text();
-      if (text.includes("Rate exceeded")) {
-        showNotification('error', 'Rate limit exceeded. Please try again later.');
-        return;
-      }
+      const data = await res.json().catch(() => ({}));
       
-      let data;
-      try {
-        data = JSON.parse(text);
-      } catch (e) {
-        console.error("Failed to parse blocked topics response", e);
-        showNotification('error', 'Server error');
-        return;
-      }
-      
-      if (response.ok) {
+      if (res.ok) {
         if (data.action === 'unblocked') {
           showNotification('success', 'Topic unblocked successfully');
         } else {
           showNotification('success', `Topic "${data.name}" blocked successfully`);
         }
         setNewBlockedTopicLink("");
+        invalidateApiCache('/api/blocked-topics');
         fetchBlockedTopics();
       } else {
         showNotification('error', data.error || 'Failed to process request');
@@ -742,11 +851,12 @@ export default function App() {
   const handleUnblockTopic = async (id: string, name?: string) => {
     if (!confirm(`Are you sure you want to unblock ${name || 'this topic'}?`)) return;
     try {
-      const response = await fetch(`/api/blocked-topics/${id}`, {
+      const response = await apiFetch(`/api/blocked-topics/${id}`, {
         method: 'DELETE',
       });
       if (response.ok) {
         showNotification('success', 'Topic unblocked successfully');
+        invalidateApiCache('/api/blocked-topics');
         fetchBlockedTopics();
       }
     } catch (err) {
@@ -1003,8 +1113,11 @@ export default function App() {
         await navigator.serviceWorker.ready;
 
         // Get VAPID public key from server
-        const response = await fetch('/api/push/vapid-public-key');
-        if (!response.ok) return;
+        let response = await fetch('/api/push/vapid-public-key').catch(() => null);
+        if (!response || !response.ok) {
+          response = await fetch('/api/vapid-public-key').catch(() => null);
+        }
+        if (!response || !response.ok) return;
         const text = await response.text();
         
         if (text.includes("Rate exceeded")) return;
@@ -1021,12 +1134,26 @@ export default function App() {
 
         let existingSub = await registration.pushManager.getSubscription().catch(() => null);
 
+        let deviceId = localStorage.getItem('botflow_device_id');
+        if (!deviceId) {
+          deviceId = 'dev_' + Math.random().toString(36).substring(2, 11) + '_' + Date.now().toString(36);
+          localStorage.setItem('botflow_device_id', deviceId);
+        }
+
+        const activeAccId = localStorage.getItem('currentProfileId') || localStorage.getItem('activeAccountId') || 'default';
+        const pushScope = localStorage.getItem('botflow_push_scope') || 'current';
+
         if (existingSub && !forceFresh) {
           const subJSON = existingSub.toJSON();
           const res = await fetch('/api/push/subscribe', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(subJSON)
+            headers: { 
+              'Content-Type': 'application/json',
+              'x-account-id': activeAccId,
+              'x-device-id': deviceId,
+              'x-push-scope': pushScope
+            },
+            body: JSON.stringify({ ...subJSON, deviceId, pushScope })
           }).catch(() => null);
 
           if (res && res.ok) {
@@ -1055,11 +1182,16 @@ export default function App() {
         console.log('Sending push subscription to server:', subscriptionJSON);
         await fetch('/api/push/subscribe', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(subscriptionJSON)
+          headers: { 
+            'Content-Type': 'application/json',
+            'x-account-id': activeAccId,
+            'x-device-id': deviceId,
+            'x-push-scope': pushScope
+          },
+          body: JSON.stringify({ ...subscriptionJSON, deviceId, pushScope })
         });
         
-        console.log('Push subscription successful');
+        console.log('Push subscription successful for account:', activeAccId);
       } catch (err: any) {
         console.warn('Push subscription unavailable or restricted:', err?.message || err);
       }
@@ -1189,14 +1321,28 @@ export default function App() {
         }
 
         
+        if (parsed.type === 'push_broadcast') {
+          const { title, message } = parsed.data || {};
+          showNotification('success', `📢 ${title || 'Push Alert'}: ${message || ''}`);
+          if (notificationSoundEnabled) playNotificationSound();
+          fetchAppState();
+          return;
+        }
+
         if (parsed.type === 'keyword_hit_notify') {
-          const notifyMsg = parsed.data.message || `🎯 Keyword Hit: ${parsed.data.keyword || 'Rule matched'} in ${parsed.data.topicName || 'Topic'}`;
+          const topicName = parsed.data.topicName || 'General';
+          const matchedWord = parsed.data.keyword || 'Rule';
+          const chatTitle = parsed.data.groupName || 'Group';
+          const userMsg = parsed.data.userMessage || '';
+          
+          const notifyMsg = `Matched "${matchedWord}" in "${topicName}" (${chatTitle})`;
           showNotification('success', notifyMsg);
           if (notificationSoundEnabled) playNotificationSound();
 
           if ("Notification" in window && Notification.permission === "granted") {
+            const shortMessage = userMsg ? `\n"${userMsg.length > 60 ? userMsg.substring(0, 60) + '...' : userMsg}"` : '';
             const options = {
-              body: notifyMsg,
+              body: `Keyword: "${matchedWord}"\nGroup: ${chatTitle}${shortMessage}`,
               icon: "/pwa-192x192.png",
               badge: "/pwa-192x192.png",
               silent: false,
@@ -1206,12 +1352,13 @@ export default function App() {
                 url: '/'
               }
             };
+            const customTitle = `🎯 ${topicName} - Keyword Hit!`;
             if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
-              navigator.serviceWorker.ready.then(reg => reg.showNotification("Keyword Alert 🎯", options)).catch(() => {
-                try { new Notification("Keyword Alert 🎯", options); } catch(e){}
+              navigator.serviceWorker.ready.then(reg => reg.showNotification(customTitle, options)).catch(() => {
+                try { new Notification(customTitle, options); } catch(e){}
               });
             } else {
-              try { new Notification("Keyword Alert 🎯", options); } catch(e){}
+              try { new Notification(customTitle, options); } catch(e){}
             }
           }
           return;
@@ -1312,7 +1459,7 @@ export default function App() {
       console.log("Closing SSE connection");
       eventSource.close();
     };
-  }, [notificationSoundEnabled, notificationSoundType, fetchBlockedTopics]);
+  }, [notificationSoundEnabled, notificationSoundType, fetchBlockedTopics, currentProfileId]);
 
   // Auth State
   const [phone, setPhone] = useState("");
@@ -1320,70 +1467,158 @@ export default function App() {
   const [password, setPassword] = useState("");
   const [authStep, setAuthStep] = useState<'credentials' | 'phone' | 'code'>('credentials');
   const [authLoading, setAuthLoading] = useState(false);
+  const hasLoadedInitialSettingsRef = useRef(false);
+  
+  const [isHeaderRefreshing, setIsHeaderRefreshing] = useState(false);
 
-  const fetchStats = async () => {
+  // Consolidated fetcher that retrieves all critical app state in a single, fast API call
+  const fetchAppState = async (forceSyncForm = false) => {
     try {
-      const res = await fetch("/api/stats");
-      const text = await res.text();
-      if (text.includes("Rate exceeded")) return;
-      if (!res.ok) {
-        throw new Error(`Server error: ${res.status}`);
-      }
-      try {
-        const data = JSON.parse(text);
-        setStats(data);
-        setTargetGroupId(data.targetGroupId || "");
-        setAutoReplyInput(data.autoReply);
-        setAppLogoInput(data.appLogo || "");
-        setAutoReply2Enabled(data.autoReply2Enabled);
-        setAutoReply2Input(data.autoReply2);
-        setAutoReply2DelayInput(data.autoReply2Delay || 1);
-        setDelaySecondsInput(data.delaySeconds);
-        setKeywordDelaySecondsInput(data.keywordDelaySeconds || 0);
-        setApiIdInput(data.apiId);
-        setApiHashInput(data.apiHash);
-        setPhotoReplyEnabled(data.photoReplyEnabled);
-        setPhotoReplyMessage(data.photoReplyMessage);
-        setPhotoReplyMessage2Enabled(data.photoReplyMessage2Enabled);
-        setPhotoReplyMessage2(data.photoReplyMessage2);
-        setPhotoReplyMessage2StartTime(data.photoReplyMessage2StartTime || "");
-        setPhotoReplyMessage2EndTime(data.photoReplyMessage2EndTime || "");
-        setPhotoReplyMax(data.photoReplyMax || 2);
-        setTopicIcon(data.topicIcon || "✅");
-        setTopicRenameEmoji(data.topicRenameEmoji || "🛑");
-        setTopicRenameKeywords(data.topicRenameKeywords || "");
-        setTopicRenameMatchMode(data.topicRenameMatchMode || "exact");
-        setAiModeEnabled(data.aiModeEnabled);
-        setAiPersona(data.aiPersona);
-        setReplyInGeneral(data.replyInGeneral);
-        setTelegramBotToken(data.telegram_bot_token || "");
-        try {
-          const parsedKeys = JSON.parse(data.geminiApiKeys || "[]");
-          setGeminiApiKeys(Array.isArray(parsedKeys) ? parsedKeys : []);
-        } catch (e) {
-          setGeminiApiKeys([]);
-        }
-        setAutoResetKeywords(data.autoResetKeywords ?? true);
-        try {
-          const parsed = JSON.parse(data.autoBlockKeywords || "[]");
-          setAutoBlockKeywords(Array.isArray(parsed) ? parsed : []);
-        } catch (e) {
-          // Fallback for old comma format
-          if (data.autoBlockKeywords) {
-            setAutoBlockKeywords(data.autoBlockKeywords.split(",").map((k: string) => ({ keyword: k.trim(), matchMode: 'partial' })).filter((k: any) => k.keyword));
-          } else {
-            setAutoBlockKeywords([]);
+      const res = await apiJson("/api/app-state");
+      if (res.ok && res.data && res.data.success) {
+        const { stats: sData, keywords: kwData, blockedTopics: btData, missedCount: mcData, logs: lData, lastImportInfo: liData } = res.data;
+        if (sData) {
+          setStats(sData);
+          if (!hasLoadedInitialSettingsRef.current || forceSyncForm) {
+            hasLoadedInitialSettingsRef.current = true;
+            setTargetGroupId(sData.targetGroupId || "");
+            setAutoReplyInput(sData.autoReply || "");
+            setAppLogoInput(sData.appLogo || "");
+            setAutoReply2Enabled(!!sData.autoReply2Enabled);
+            setAutoReply2Input(sData.autoReply2 || "");
+            setAutoReply2DelayInput(sData.autoReply2Delay || 1);
+            setDelaySecondsInput(sData.delaySeconds || 0);
+            setKeywordDelaySecondsInput(sData.keywordDelaySeconds || 0);
+            setApiIdInput(sData.apiId || "");
+            setApiHashInput(sData.apiHash || "");
+            setPhotoReplyEnabled(!!sData.photoReplyEnabled);
+            setPhotoReplyMessage(sData.photoReplyMessage || "");
+            setPhotoReplyMessage2Enabled(!!sData.photoReplyMessage2Enabled);
+            setPhotoReplyMessage2(sData.photoReplyMessage2 || "");
+            setPhotoReplyMessage2StartTime(sData.photoReplyMessage2StartTime || "");
+            setPhotoReplyMessage2EndTime(sData.photoReplyMessage2EndTime || "");
+            setPhotoReplyMax(sData.photoReplyMax || 2);
+            setTopicIcon(sData.topicIcon || "✅");
+            setTopicRenameEmoji(sData.topicRenameEmoji || "🛑");
+            setTopicRenameKeywords(sData.topicRenameKeywords || "");
+            setTopicRenameMatchMode(sData.topicRenameMatchMode || "exact");
+            setAiModeEnabled(!!sData.aiModeEnabled);
+            setAiPersona(sData.aiPersona || "");
+            setReplyInGeneral(!!sData.replyInGeneral);
+            setTelegramBotToken(sData.telegram_bot_token || "");
+            try {
+              const parsedKeys = JSON.parse(sData.geminiApiKeys || "[]");
+              setGeminiApiKeys(Array.isArray(parsedKeys) ? parsedKeys : []);
+            } catch (e) {
+              setGeminiApiKeys([]);
+            }
+            setAutoResetKeywords(sData.autoResetKeywords ?? true);
+            try {
+              const parsed = JSON.parse(sData.autoBlockKeywords || "[]");
+              setAutoBlockKeywords(Array.isArray(parsed) ? parsed : []);
+            } catch (e) {
+              if (sData.autoBlockKeywords) {
+                setAutoBlockKeywords(sData.autoBlockKeywords.split(",").map((k: string) => ({ keyword: k.trim(), matchMode: 'partial' })).filter((k: any) => k.keyword));
+              } else {
+                setAutoBlockKeywords([]);
+              }
+            }
+            setNotificationSoundEnabled(!!sData.notificationSoundEnabled);
+            setNotificationSoundType(sData.notificationSoundType || "default");
+            if (!phone) setPhone(sData.defaultPhone || "");
+            
+            if (sData.apiId && sData.apiHash && sData.apiId !== "0" && sData.apiHash !== "") {
+              setAuthStep(prev => prev === 'credentials' ? 'phone' : prev);
+            }
           }
         }
-        setNotificationSoundEnabled(data.notificationSoundEnabled);
-        setNotificationSoundType(data.notificationSoundType || "default");
-        if (!phone) setPhone(data.defaultPhone);
+        if (Array.isArray(kwData)) setKeywords(kwData);
+        if (Array.isArray(btData)) setBlockedTopics(btData);
+        if (typeof mcData === 'number') setMissedCount(mcData);
+        if (Array.isArray(lData) && lData.length > 0) setLogs(lData);
+        if (liData) setLastImportInfo(liData);
+      }
+    } catch (err: any) {
+      console.error("fetchAppState error:", err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleManualRefresh = async () => {
+    if (isHeaderRefreshing) return;
+    setIsHeaderRefreshing(true);
+    invalidateApiCache();
+    try {
+      await fetchAppState(true);
+      showNotification('success', 'Data refreshed successfully! ⚡');
+    } catch (err) {
+      console.error("Refresh failed:", err);
+      showNotification('error', 'Failed to refresh data.');
+    } finally {
+      setIsHeaderRefreshing(false);
+    }
+  };
+
+  const fetchStats = async (forceSyncForm = false) => {
+    try {
+      const res = await apiJson("/api/stats");
+      if (res.ok && res.data) {
+        const data = res.data;
+        setStats(data);
         
-        if (data.apiId && data.apiHash && data.apiId !== "0" && data.apiHash !== "") {
-          setAuthStep(prev => prev === 'credentials' ? 'phone' : prev);
+        if (!hasLoadedInitialSettingsRef.current || forceSyncForm) {
+          hasLoadedInitialSettingsRef.current = true;
+          setTargetGroupId(data.targetGroupId || "");
+          setAutoReplyInput(data.autoReply || "");
+          setAppLogoInput(data.appLogo || "");
+          setAutoReply2Enabled(!!data.autoReply2Enabled);
+          setAutoReply2Input(data.autoReply2 || "");
+          setAutoReply2DelayInput(data.autoReply2Delay || 1);
+          setDelaySecondsInput(data.delaySeconds || 0);
+          setKeywordDelaySecondsInput(data.keywordDelaySeconds || 0);
+          setApiIdInput(data.apiId || "");
+          setApiHashInput(data.apiHash || "");
+          setPhotoReplyEnabled(!!data.photoReplyEnabled);
+          setPhotoReplyMessage(data.photoReplyMessage || "");
+          setPhotoReplyMessage2Enabled(!!data.photoReplyMessage2Enabled);
+          setPhotoReplyMessage2(data.photoReplyMessage2 || "");
+          setPhotoReplyMessage2StartTime(data.photoReplyMessage2StartTime || "");
+          setPhotoReplyMessage2EndTime(data.photoReplyMessage2EndTime || "");
+          setPhotoReplyMax(data.photoReplyMax || 2);
+          setTopicIcon(data.topicIcon || "✅");
+          setTopicRenameEmoji(data.topicRenameEmoji || "🛑");
+          setTopicRenameKeywords(data.topicRenameKeywords || "");
+          setTopicRenameMatchMode(data.topicRenameMatchMode || "exact");
+          setAiModeEnabled(!!data.aiModeEnabled);
+          setAiPersona(data.aiPersona || "");
+          setReplyInGeneral(!!data.replyInGeneral);
+          setTelegramBotToken(data.telegram_bot_token || "");
+          try {
+            const parsedKeys = JSON.parse(data.geminiApiKeys || "[]");
+            setGeminiApiKeys(Array.isArray(parsedKeys) ? parsedKeys : []);
+          } catch (e) {
+            setGeminiApiKeys([]);
+          }
+          setAutoResetKeywords(data.autoResetKeywords ?? true);
+          try {
+            const parsed = JSON.parse(data.autoBlockKeywords || "[]");
+            setAutoBlockKeywords(Array.isArray(parsed) ? parsed : []);
+          } catch (e) {
+            if (data.autoBlockKeywords) {
+              setAutoBlockKeywords(data.autoBlockKeywords.split(",").map((k: string) => ({ keyword: k.trim(), matchMode: 'partial' })).filter((k: any) => k.keyword));
+            } else {
+              setAutoBlockKeywords([]);
+            }
+          }
+          setNotificationSoundEnabled(!!data.notificationSoundEnabled);
+          setNotificationSoundType(data.notificationSoundType || "default");
+          if (!phone) setPhone(data.defaultPhone || "");
+          
+          if (data.apiId && data.apiHash && data.apiId !== "0" && data.apiHash !== "") {
+            setAuthStep(prev => prev === 'credentials' ? 'phone' : prev);
+          }
         }
-      } catch (e) {
-        console.error("Failed to parse stats JSON:", text);
       }
     } catch (err: any) {
       if (err.message !== "Failed to fetch") {
@@ -1396,14 +1631,10 @@ export default function App() {
 
   const fetchKeywords = async () => {
     try {
-      const res = await fetch("/api/keywords");
-      const text = await res.text();
-      if (text.includes("Rate exceeded")) return;
-      if (!res.ok) {
-        throw new Error(`Server error: ${res.status}`);
+      const res = await apiJson("/api/keywords");
+      if (res.ok && Array.isArray(res.data)) {
+        setKeywords(res.data);
       }
-      const data = JSON.parse(text);
-      setKeywords(data);
     } catch (err: any) {
       if (err.message !== "Failed to fetch") {
         console.error("Failed to fetch keywords", err);
@@ -1487,36 +1718,24 @@ export default function App() {
   const fetchLogs = async () => {
     setRefreshingLogs(true);
     try {
-      const res = await fetch("/api/logs");
-      const text = await res.text();
-      if (text.includes("Rate exceeded")) return;
-      if (!res.ok) {
-        throw new Error(`Server error: ${res.status}`);
+      const res = await apiJson("/api/logs");
+      if (res.ok && Array.isArray(res.data)) {
+        setLogs(res.data);
       }
-      const data = JSON.parse(text);
-      setLogs(data);
     } catch (err: any) {
       if (err.message !== "Failed to fetch") {
         console.error("Failed to fetch logs", err);
       }
     } finally {
-      // Add a slight delay so the animation is visible even for fast requests
       setTimeout(() => setRefreshingLogs(false), 500);
     }
   };
 
   const fetchAnalytics = async () => {
     try {
-      const res = await fetch("/api/analytics");
-      const text = await res.text();
-      if (text.includes("Rate exceeded")) return;
-      if (res.ok) {
-        try {
-          const data = JSON.parse(text);
-          setAnalyticsData(data);
-        } catch (e) {
-          console.error("Failed to parse analytics JSON:", text);
-        }
+      const res = await apiJson("/api/analytics");
+      if (res.ok && res.data) {
+        setAnalyticsData(res.data);
       }
     } catch (err: any) {
       if (err.message !== "Failed to fetch") {
@@ -1564,6 +1783,53 @@ export default function App() {
     }
   };
 
+  const handleGenerateSuggestions = async () => {
+    setIsGeneratingSuggestions(true);
+    setAiSuggestionsError("");
+    try {
+      const res = await fetch("/api/gemini/suggest-keywords");
+      if (!res.ok) {
+        const errData = await res.json();
+        throw new Error(errData.error || "Failed to generate suggestions");
+      }
+      const data = await res.json();
+      setAiSuggestions(data.suggestions || []);
+      showNotification('success', 'AI Keyword Suggestions generated successfully!');
+    } catch (err: any) {
+      console.error(err);
+      setAiSuggestionsError(err.message || "Something went wrong.");
+      showNotification('error', err.message || 'Failed to generate suggestions');
+    } finally {
+      setIsGeneratingSuggestions(false);
+    }
+  };
+
+  const handleAddSuggestedKeyword = async (suggestion: any) => {
+    try {
+      const res = await fetch("/api/keywords", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          keyword: suggestion.keyword,
+          keywords: suggestion.keywords,
+          reply: suggestion.reply,
+          match_mode: "partial",
+          enabled: true
+        })
+      });
+      if (res.ok) {
+        setAddedSuggestions(prev => [...prev, suggestion.keyword]);
+        showNotification('success', `Added rule "${suggestion.keyword}" successfully!`);
+        fetchKeywords();
+      } else {
+        const errData = await res.json();
+        showNotification('error', errData.error || "Failed to add keyword");
+      }
+    } catch (err: any) {
+      showNotification('error', err.message || "Failed to add keyword");
+    }
+  };
+
   const clearLogs = async () => {
     if (!isConfirmingClear) {
       setIsConfirmingClear(true);
@@ -1603,18 +1869,11 @@ export default function App() {
 
   const fetchMissedCount = async () => {
     try {
-      const res = await fetch("/api/missed-count");
-      const text = await res.text();
-      if (text.includes("Rate exceeded")) return;
-      if (!res.ok) return;
-      try {
-        const data = JSON.parse(text);
-        setMissedCount(data.count || 0);
-      } catch (e) {
-        console.error("Failed to parse missed count JSON:", text);
+      const res = await apiJson("/api/missed-count");
+      if (res.ok && res.data && typeof res.data.count === 'number') {
+        setMissedCount(res.data.count);
       }
     } catch (e: any) {
-      // Suppress "Failed to fetch" network errors (e.g. during server restart)
       if (e.message !== "Failed to fetch") {
         console.error("Failed to fetch missed count", e);
       }
@@ -1624,15 +1883,9 @@ export default function App() {
   const fetchMissedList = async () => {
     setIsFetchingMissed(true);
     try {
-      const res = await fetch("/api/missed-list");
-      const text = await res.text();
-      if (text.includes("Rate exceeded")) return;
-      if (!res.ok) return;
-      try {
-        const data = JSON.parse(text);
-        setMissedList(Array.isArray(data) ? data : []);
-      } catch (e) {
-        console.error("Failed to parse missed list JSON:", text);
+      const res = await apiJson("/api/missed-list");
+      if (res.ok && Array.isArray(res.data)) {
+        setMissedList(res.data);
       }
     } catch (err) {
       console.error("Failed to fetch missed list", err);
@@ -1821,22 +2074,45 @@ export default function App() {
   };
 
   useEffect(() => {
-    fetchStats();
-    fetchKeywords();
-    fetchLogs();
-    fetchBlockedTopics();
+    fetchAppState();
     fetchAnalytics();
-    fetchMissedCount();
+    fetchImportBatches();
+    pingDeviceSession(currentProfileId);
 
-    // Auto-refresh stats, keywords and missed count every 10 seconds globally
+    const handleAccountChangeEvent = (e: any) => {
+      console.log("Smooth Account Change Event received:", e.detail);
+      invalidateApiCache();
+      fetchAppState(true);
+      fetchAnalytics();
+      fetchImportBatches();
+      pingDeviceSession(e.detail?.id || currentProfileId);
+    };
+
+    window.addEventListener('account_changed', handleAccountChangeEvent);
+
+    // Consolidated background sync every 25 seconds, only when tab is visible
     const globalInterval = setInterval(() => {
-      fetchStats();
-      fetchMissedCount();
-      fetchKeywords();
-    }, 10000);
+      if (!document.hidden) {
+        fetchAppState();
+        pingDeviceSession(currentProfileId);
+      }
+    }, 25000);
 
-    return () => clearInterval(globalInterval);
-  }, []);
+    return () => {
+      window.removeEventListener('account_changed', handleAccountChangeEvent);
+      clearInterval(globalInterval);
+    };
+  }, [currentProfileId]);
+
+  useEffect(() => {
+    if (isNotificationOpen) {
+      setUnreadCount(0);
+      setLastSeenLogCount(logs.length);
+    } else {
+      const diff = Math.max(0, logs.length - lastSeenLogCount);
+      setUnreadCount(diff);
+    }
+  }, [logs.length, isNotificationOpen, lastSeenLogCount]);
 
   useEffect(() => {
     if (activeTab === 'logs') {
@@ -1847,18 +2123,17 @@ export default function App() {
       fetchMissedList();
     }
 
-    // Auto-refresh active tab data every 10 seconds for instant, live updates
+    // Refresh active tab data every 25 seconds when visible
     const tabInterval = setInterval(() => {
-      if (activeTab === 'dashboard') {
-        fetchLogs(); // Keep dashboard Live Logs perfectly updated
-      } else if (activeTab === 'logs') {
+      if (document.hidden) return;
+      if (activeTab === 'dashboard' || activeTab === 'logs') {
         fetchLogs();
       } else if (activeTab === 'analytics') {
         fetchAnalytics();
       } else if (activeTab === 'catchup') {
         fetchMissedList();
       }
-    }, 10000);
+    }, 25000);
 
     return () => clearInterval(tabInterval);
   }, [activeTab]);
@@ -1898,9 +2173,11 @@ export default function App() {
 
   const testPush = async () => {
     try {
+      showNotification('success', 'Refreshing push subscription...');
+      await subscribeToPush(true).catch(() => {});
       const response = await fetch('/api/push/test', { method: 'POST' });
       if (response.ok) {
-        showNotification('success', 'Test push sent!');
+        showNotification('success', '🔔 Test push sent! Close the app or lock phone to verify background delivery.');
       } else {
         showNotification('error', 'Failed to send test push.');
       }
@@ -2145,7 +2422,7 @@ export default function App() {
       
       if (res.ok) {
         showNotification('success', 'Settings updated!');
-        fetchStats();
+        fetchStats(true);
       } else {
         showNotification('error', data?.error || `Update failed: ${res.statusText}`);
       }
@@ -2511,6 +2788,119 @@ export default function App() {
     }
   };
 
+  const fetchLastImportInfo = async () => {
+    try {
+      const res = await apiJson("/api/data/last-import-info");
+      if (res.ok && res.data) {
+        setLastImportInfo(res.data);
+      }
+    } catch (e) {
+      console.error("Failed to fetch last import info:", e);
+    }
+  };
+
+  const fetchImportBatches = async () => {
+    setIsFetchingBatches(true);
+    try {
+      const res = await apiJson("/api/data/import-batches");
+      if (res.ok && Array.isArray(res.data)) {
+        setImportBatches(res.data);
+      }
+    } catch (e) {
+      console.error("Failed to fetch import batches:", e);
+    } finally {
+      setIsFetchingBatches(false);
+    }
+  };
+
+  const handleDeleteImportBatch = async (batchId: string) => {
+    setDeletingBatchId(batchId);
+    try {
+      const res = await apiFetch(`/api/data/import-batch/${batchId}`, { method: "DELETE" });
+      const data = await res.json().catch(() => ({}));
+
+      if (res.ok) {
+        setBatchToDelete(null);
+        showNotification('success', data?.message || 'Imported batch deleted successfully!');
+        invalidateApiCache();
+        fetchAppState(true);
+        fetchImportBatches();
+      } else {
+        showNotification('error', data?.error || 'Failed to delete imported file');
+      }
+    } catch (err) {
+      console.error("Failed to delete imported batch:", err);
+      showNotification('error', 'Error deleting imported file');
+    } finally {
+      setDeletingBatchId(null);
+    }
+  };
+
+  const handleAccountSwitch = async (profile: { id: string; name: string }) => {
+    showNotification('success', `Switched to ${profile.name}`);
+    setCurrentProfileId(profile.id);
+    invalidateApiCache();
+    try {
+      await Promise.all([
+        fetchAppState(true),
+        fetchAnalytics(),
+        fetchImportBatches()
+      ]);
+    } catch (e) {
+      console.error("Failed to refresh on account switch:", e);
+    }
+  };
+
+  const handleDeleteLastImport = async () => {
+    setDeletingLastImport(true);
+    try {
+      const res = await fetch("/api/data/last-import", { method: "DELETE" });
+      const text = await res.text();
+      let data: any = null;
+      try { data = JSON.parse(text); } catch(e) {}
+
+      if (res.ok) {
+        setShowDeleteLastKeywordConfirm(false);
+        showNotification('success', data?.message || 'Last imported data deleted successfully!');
+        fetchKeywords();
+        fetchStats();
+        fetchLastImportInfo();
+      } else {
+        showNotification('error', data?.error || 'Failed to delete last imported data');
+      }
+    } catch (err) {
+      console.error("Failed to delete last import:", err);
+      showNotification('error', 'Error deleting last import');
+    } finally {
+      setDeletingLastImport(false);
+    }
+  };
+
+  const handleDeleteLastRule = async () => {
+    setDeletingLastRule(true);
+    try {
+      const res = await fetch("/api/data/last-rule", { method: "DELETE" });
+      const text = await res.text();
+      let data: any = null;
+      try { data = JSON.parse(text); } catch(e) {}
+
+      if (res.ok) {
+        setShowDeleteLastRuleConfirm(false);
+        showNotification('success', data?.message || 'Last rule deleted successfully!');
+        fetchKeywords();
+        fetchStats();
+        fetchLastImportInfo();
+      } else {
+        showNotification('error', data?.error || 'Failed to delete last rule');
+      }
+    } catch (err) {
+      console.error("Failed to delete last rule:", err);
+      showNotification('error', 'Error deleting last rule');
+    } finally {
+      setDeletingLastRule(false);
+    }
+  };
+
   const handleImportData = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -2522,16 +2912,20 @@ export default function App() {
         const content = event.target?.result as string;
         const data = JSON.parse(content);
         
+        const fileName = file.name || 'imported_rules.json';
         const res = await fetch("/api/data/import", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(data),
+          body: JSON.stringify({ ...data, fileName }),
         });
 
         if (res.ok) {
-          showNotification('success', 'Data imported successfully');
+          const resData = await res.json();
+          showNotification('success', `Data imported successfully (${resData?.count || 'all'} rules)`);
           fetchKeywords();
           fetchStats();
+          fetchLastImportInfo();
+          fetchImportBatches();
         } else {
           showNotification('error', 'Import failed');
         }
@@ -2655,69 +3049,95 @@ export default function App() {
           key="loading"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
-          exit={{ opacity: 0, scale: 1.1, filter: "blur(10px)" }}
-          className="fixed inset-0 z-[1000] bg-black flex flex-col items-center justify-center overflow-hidden"
+          exit={{ opacity: 0, scale: 1.05, filter: "blur(12px)" }}
+          className="fixed inset-0 z-[1000] bg-[#07090e] flex flex-col items-center justify-center overflow-hidden"
         >
-          {/* Background Glow */}
+          {/* Cyberpunk Grid / Ambient Light */}
           <div className="absolute inset-0 overflow-hidden pointer-events-none">
-            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[60%] h-[60%] rounded-full blur-[120px] opacity-20 bg-blue-500" />
-            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[40%] h-[40%] rounded-full blur-[100px] opacity-10 bg-emerald-500" />
+            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[70%] h-[70%] rounded-full blur-[140px] opacity-15 bg-blue-600" />
+            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[50%] h-[50%] rounded-full blur-[120px] opacity-15 bg-emerald-600" />
+            <div className="absolute inset-0 bg-[radial-gradient(#ffffff_1px,transparent_1px)] [background-size:32px_32px] opacity-[0.03]" />
           </div>
 
           <motion.div
-            initial={{ scale: 0.8, opacity: 0 }}
+            initial={{ scale: 0.85, opacity: 0 }}
             animate={{ scale: 1, opacity: 1 }}
-            transition={{ type: "spring", damping: 20, stiffness: 100 }}
+            transition={{ type: "spring", damping: 22, stiffness: 120 }}
             className="relative z-10 flex flex-col items-center"
           >
-            <div className="relative w-24 h-24 mb-8">
-              <div className="absolute inset-0 bg-gradient-to-tr from-emerald-500 to-blue-500 rounded-2xl rotate-6 opacity-40 animate-pulse"></div>
-              <div className="relative w-full h-full rounded-2xl overflow-hidden flex items-center justify-center border border-white/20 bg-neutral-900 shadow-2xl">
-                <img src={stats?.appLogo || "/logo.jpg"} alt="Logo" className="w-14 h-14 object-contain rounded-xl" />
+            {/* Multi-Ring Orbital Loader */}
+            <div className="relative w-32 h-32 mb-10 flex items-center justify-center">
+              {/* Outer Rotating Dashed Ring */}
+              <motion.div 
+                animate={{ rotate: 360 }}
+                transition={{ repeat: Infinity, duration: 12, ease: "linear" }}
+                className="absolute inset-0 rounded-full border border-dashed border-emerald-500/30"
+              />
+              {/* Middle Counter-Rotating Glowing Ring */}
+              <motion.div 
+                animate={{ rotate: -360 }}
+                transition={{ repeat: Infinity, duration: 8, ease: "linear" }}
+                className="absolute -inset-3 rounded-full border-2 border-transparent border-t-blue-500 border-b-emerald-400 shadow-[0_0_20px_rgba(16,185,129,0.2)]"
+              />
+              {/* Inner Pulsing Ring */}
+              <motion.div 
+                animate={{ scale: [1, 1.08, 1], opacity: [0.3, 0.7, 0.3] }}
+                transition={{ repeat: Infinity, duration: 2.5, ease: "easeInOut" }}
+                className="absolute -inset-6 rounded-full bg-gradient-to-r from-blue-500/10 to-emerald-500/10 blur-md"
+              />
+
+              {/* Central Logo Container */}
+              <div className="relative w-20 h-20 rounded-2xl overflow-hidden flex items-center justify-center border border-white/20 bg-neutral-900/90 shadow-2xl backdrop-blur-xl">
+                <div className="absolute inset-0 bg-gradient-to-tr from-emerald-500/20 to-blue-500/20 animate-pulse" />
+                <img src={stats?.appLogo || "/logo.jpg"} alt="Logo" className="w-12 h-12 object-contain rounded-xl relative z-10" />
               </div>
-              {/* Spinning Ring */}
-              <div className="absolute -inset-4 border-2 border-white/5 border-t-emerald-500 rounded-full animate-spin"></div>
             </div>
 
-            <div className="flex flex-col items-center space-y-2">
-              <div className="flex items-center space-x-2">
-                <h1 className="text-3xl font-black tracking-tighter text-white bg-clip-text text-transparent bg-gradient-to-r from-white via-blue-100 to-emerald-100">
+            {/* Typography & Pulse Status */}
+            <div className="flex flex-col items-center space-y-3">
+              <div className="flex items-center space-x-2.5">
+                <h1 className="text-3xl font-black tracking-tight text-white bg-clip-text text-transparent bg-gradient-to-r from-white via-blue-100 to-emerald-200">
                   BotFlow
                 </h1>
-                <Sparkles className="w-5 h-5 text-emerald-400 animate-pulse" />
+                <div className="px-2 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/30 flex items-center space-x-1.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
+                  <span className="text-[10px] font-black text-emerald-400 tracking-wider uppercase">v3.7</span>
+                </div>
               </div>
-              <div className="flex items-center space-x-2">
-                <span className="text-[10px] font-black text-emerald-500 tracking-[0.4em] uppercase">Premium AI</span>
-                <div className="flex space-x-1">
+
+              <div className="flex items-center space-x-2 bg-white/[0.03] px-4 py-1.5 rounded-full border border-white/10 backdrop-blur-md">
+                <Sparkles className="w-3.5 h-3.5 text-emerald-400 animate-pulse" />
+                <span className="text-[11px] font-medium text-white/70 tracking-wide">Syncing Neural Workspace</span>
+                <div className="flex space-x-1 pl-1">
                   <motion.div 
-                    animate={{ opacity: [0, 1, 0] }}
+                    animate={{ scale: [0.8, 1.4, 0.8], opacity: [0.4, 1, 0.4] }}
                     transition={{ repeat: Infinity, duration: 1, delay: 0 }}
-                    className="w-1 h-1 rounded-full bg-emerald-500" 
+                    className="w-1.5 h-1.5 rounded-full bg-emerald-400" 
                   />
                   <motion.div 
-                    animate={{ opacity: [0, 1, 0] }}
+                    animate={{ scale: [0.8, 1.4, 0.8], opacity: [0.4, 1, 0.4] }}
                     transition={{ repeat: Infinity, duration: 1, delay: 0.2 }}
-                    className="w-1 h-1 rounded-full bg-emerald-500" 
+                    className="w-1.5 h-1.5 rounded-full bg-blue-400" 
                   />
                   <motion.div 
-                    animate={{ opacity: [0, 1, 0] }}
+                    animate={{ scale: [0.8, 1.4, 0.8], opacity: [0.4, 1, 0.4] }}
                     transition={{ repeat: Infinity, duration: 1, delay: 0.4 }}
-                    className="w-1 h-1 rounded-full bg-emerald-500" 
+                    className="w-1.5 h-1.5 rounded-full bg-emerald-400" 
                   />
                 </div>
               </div>
             </div>
           </motion.div>
 
-          {/* Bottom Text */}
-          <div className="absolute bottom-12 left-0 right-0 flex flex-col items-center space-y-1">
-            <p className="text-[10px] font-bold text-white/30 tracking-widest uppercase">Initializing Secure Connection</p>
-            <div className="w-32 h-0.5 bg-white/5 rounded-full overflow-hidden">
+          {/* Bottom Progress Bar */}
+          <div className="absolute bottom-16 left-0 right-0 flex flex-col items-center space-y-2">
+            <p className="text-[10px] font-semibold text-white/40 tracking-[0.2em] uppercase">Secure Cloud Connection Active</p>
+            <div className="w-48 h-1 bg-white/5 rounded-full overflow-hidden border border-white/5">
               <motion.div 
                 initial={{ x: "-100%" }}
                 animate={{ x: "100%" }}
-                transition={{ repeat: Infinity, duration: 1.5, ease: "linear" }}
-                className="w-1/2 h-full bg-gradient-to-r from-transparent via-blue-500 to-transparent"
+                transition={{ repeat: Infinity, duration: 1.8, ease: "easeInOut" }}
+                className="w-3/4 h-full bg-gradient-to-r from-transparent via-emerald-400 to-transparent shadow-[0_0_12px_rgba(16,185,129,0.8)]"
               />
             </div>
           </div>
@@ -2738,24 +3158,24 @@ export default function App() {
       </div>
 
       {/* Header */}
-      <header className={`px-3 sm:px-6 py-2 flex items-center justify-between fixed top-0 left-0 right-0 z-50 border-b transition-all duration-500 bg-black border-white/10 text-white shadow-2xl ${activeTab === 'logs' ? 'opacity-0 pointer-events-none -translate-y-full' : 'opacity-100 translate-y-0'}`}>
+      <header className={`px-2 sm:px-6 py-2 flex items-center justify-between fixed top-0 left-0 right-0 z-50 border-b transition-all duration-500 bg-black border-white/10 text-white shadow-2xl ${activeTab === 'logs' ? 'opacity-0 pointer-events-none -translate-y-full' : 'opacity-100 translate-y-0'}`}>
         
         {/* Oval glow effect */}
         <div className="absolute inset-0 overflow-hidden pointer-events-none">
           <div className="absolute top-0 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[80%] h-[200%] rounded-[100%] blur-3xl opacity-20 bg-white" />
         </div>
 
-        <div className="flex items-center space-x-3 relative z-10">
+        <div className="flex items-center space-x-1.5 sm:space-x-3 relative z-10 shrink-0">
           <div className="relative">
             <button 
               onClick={() => setIsMenuOpen(!isMenuOpen)}
-              className="p-2 rounded-xl transition relative group text-blue-400 hover:text-white hover:bg-white/10"
+              className="p-1.5 sm:p-2 rounded-xl transition relative group text-blue-400 hover:text-white hover:bg-white/10"
             >
-              <div className="relative z-10 flex items-center justify-center w-[22px] h-[22px]">
-                <div className="flex flex-col items-start justify-center w-full h-full space-y-1.5 transition duration-300 drop-shadow-[0_0_8px_rgba(255,255,255,0.6)] group-hover:drop-shadow-[0_0_12px_rgba(255,255,255,1)]">
-                  <span className={`h-0.5 rounded-full transition duration-300 ${isMenuOpen ? 'w-[22px] translate-y-2 rotate-45 bg-white' : 'w-[22px] bg-white'}`}></span>
-                  <span className={`h-0.5 rounded-full transition duration-300 ${isMenuOpen ? 'w-0 opacity-0 bg-white' : 'w-[16px] bg-white'}`}></span>
-                  <span className={`h-0.5 rounded-full transition duration-300 ${isMenuOpen ? 'w-[22px] -translate-y-2 -rotate-45 bg-white' : 'w-[10px] bg-white'}`}></span>
+              <div className="relative z-10 flex items-center justify-center w-[20px] h-[20px] sm:w-[22px] sm:h-[22px]">
+                <div className="flex flex-col items-start justify-center w-full h-full space-y-1 sm:space-y-1.5 transition duration-300 drop-shadow-[0_0_8px_rgba(255,255,255,0.6)] group-hover:drop-shadow-[0_0_12px_rgba(255,255,255,1)]">
+                  <span className={`h-0.5 rounded-full transition duration-300 ${isMenuOpen ? 'w-[20px] sm:w-[22px] translate-y-2 rotate-45 bg-white' : 'w-[20px] sm:w-[22px] bg-white'}`}></span>
+                  <span className={`h-0.5 rounded-full transition duration-300 ${isMenuOpen ? 'w-0 opacity-0 bg-white' : 'w-[14px] sm:w-[16px] bg-white'}`}></span>
+                  <span className={`h-0.5 rounded-full transition duration-300 ${isMenuOpen ? 'w-[20px] sm:w-[22px] -translate-y-2 -rotate-45 bg-white' : 'w-[9px] sm:w-[10px] bg-white'}`}></span>
                 </div>
                 {isMenuOpen && (
                   <motion.div 
@@ -2767,31 +3187,31 @@ export default function App() {
               <div className="absolute inset-0 bg-white/5 rounded-xl opacity-0 group-hover:opacity-100 transition-opacity"></div>
             </button>
             {/* Status dot overlapping the 3-line bar */}
-            <div className={`absolute top-1.5 right-1.5 w-2.5 h-2.5 rounded-full border-2 border-black z-20 ${stats?.isUserBotConnected ? 'bg-emerald-500' : 'bg-rose-500'}`}>
+            <div className={`absolute top-1 right-1 sm:top-1.5 sm:right-1.5 w-2 h-2 sm:w-2.5 sm:h-2.5 rounded-full border-2 border-black z-20 ${stats?.isUserBotConnected ? 'bg-emerald-500' : 'bg-rose-500'}`}>
                <div className={`absolute inset-0 rounded-full animate-ping opacity-75 ${stats?.isUserBotConnected ? 'bg-emerald-400' : 'bg-rose-400'}`}></div>
             </div>
           </div>
 
-          <div className="flex items-center space-x-2 sm:space-x-3">
+          <div className="flex items-center space-x-1.5 sm:space-x-3">
             <div 
               onClick={() => setIsLogoModalOpen(true)}
-              className="relative w-8 h-8 group cursor-pointer shrink-0" 
+              className="relative w-7 h-7 sm:w-8 sm:h-8 group cursor-pointer shrink-0" 
               title="Click to choose or upload app logo"
             >
               <div className="absolute inset-0 bg-gradient-to-tr from-emerald-500 to-blue-500 rounded-lg rotate-3 opacity-40 group-hover:rotate-6 transition-transform duration-500"></div>
               <div className="relative w-full h-full rounded-lg overflow-hidden flex items-center justify-center border transition-colors duration-500 bg-neutral-900 border-white/10 group-hover:border-emerald-500/50">
-                <img src={appLogoInput || stats?.appLogo || "/pwa-192x192.png"} alt="Logo" className="w-5 h-5 object-contain rounded-md" />
+                <img src={appLogoInput || stats?.appLogo || "/pwa-192x192.png"} alt="Logo" className="w-4 h-4 sm:w-5 sm:h-5 object-contain rounded-md" />
               </div>
             </div>
             <div className="flex flex-col">
               <div className="flex items-center space-x-1">
-                <h1 className="font-black text-base sm:text-xl tracking-tighter leading-none transition-colors duration-500 text-white bg-clip-text text-transparent bg-gradient-to-r from-white via-blue-100 to-emerald-100">
+                <h1 className="font-black text-sm sm:text-xl tracking-tighter leading-none transition-colors duration-500 text-white bg-clip-text text-transparent bg-gradient-to-r from-white via-blue-100 to-emerald-100">
                   BotFlow
                 </h1>
-                <Sparkles className="w-3 h-3 text-emerald-400 animate-pulse" />
+                <Sparkles className="w-2.5 h-2.5 sm:w-3 sm:h-3 text-emerald-400 animate-pulse" />
               </div>
               <div className="flex items-center space-x-1">
-                <span className="text-[7px] font-black text-emerald-400 tracking-[0.3em] uppercase block">Premium AI</span>
+                <span className="text-[6.5px] sm:text-[7px] font-black text-emerald-400 tracking-[0.25em] uppercase block">v3.7 • Premium AI</span>
                 <div className="w-1 h-1 rounded-full bg-emerald-500 animate-ping" />
               </div>
             </div>
@@ -2799,12 +3219,27 @@ export default function App() {
         </div>
         
         {/* Right Side Controls: Account Switcher & Notifications */}
-        <div className="flex items-center space-x-1.5 sm:space-x-2 relative z-10 shrink-0">
-          <ProfileSelector isConnected={stats?.isUserBotConnected} />
+        <div className="flex items-center space-x-1 sm:space-x-2 relative z-10 shrink-0">
+          <ProfileSelector isConnected={stats?.isUserBotConnected} onSwitchAccount={handleAccountSwitch} />
+
+          {/* Quick manual refresh button */}
+          <button 
+            onClick={handleManualRefresh}
+            disabled={isHeaderRefreshing}
+            className={`p-1 sm:p-2 rounded-lg sm:rounded-xl transition relative group text-emerald-400 hover:text-white hover:bg-white/10 shrink-0 ${isHeaderRefreshing ? 'cursor-not-allowed opacity-65' : ''}`}
+            title="Refresh App Data"
+          >
+            <motion.div
+              animate={isHeaderRefreshing ? { rotate: 360 } : {}}
+              transition={isHeaderRefreshing ? { repeat: Infinity, duration: 1, ease: "linear" } : { type: "spring", stiffness: 200 }}
+            >
+              <RefreshCw size={19} className="transition duration-300 drop-shadow-[0_0_8px_rgba(16,185,129,0.8)] sm:w-[22px] sm:h-[22px]" />
+            </motion.div>
+          </button>
 
           <button 
             onClick={() => setIsNotificationOpen(true)}
-            className="p-2 rounded-xl transition relative group text-rose-400 hover:text-white hover:bg-white/10 shrink-0"
+            className="p-1 sm:p-2 rounded-lg sm:rounded-xl transition relative group text-rose-400 hover:text-white hover:bg-white/10 shrink-0"
             aria-label="Notifications"
           >
             <motion.div
@@ -2820,13 +3255,13 @@ export default function App() {
                 ease: "easeInOut"
               }}
             >
-              <Bell size={22} className={`transition duration-300 drop-shadow-[0_0_8px_rgba(251,113,133,0.8)] group-hover:drop-shadow-[0_0_12px_rgba(255,255,255,0.8)] ${unreadCount > 0 ? 'text-rose-500' : ''}`} />
+              <Bell size={19} className={`transition duration-300 drop-shadow-[0_0_8px_rgba(251,113,133,0.8)] group-hover:drop-shadow-[0_0_12px_rgba(255,255,255,0.8)] sm:w-[22px] sm:h-[22px] ${unreadCount > 0 ? 'text-rose-500' : ''}`} />
             </motion.div>
             {unreadCount > 0 && (
               <motion.span 
                 initial={{ scale: 0, rotate: -45 }}
                 animate={{ scale: 1, rotate: 0 }}
-                className="absolute -top-1 -right-1 min-w-[18px] h-[18px] px-1 bg-rose-500 text-white text-[9px] font-black flex items-center justify-center rounded-full border-2 border-black shadow-[0_0_15px_rgba(244,63,94,0.8)] group-hover:scale-125 transition-transform"
+                className="absolute -top-1 -right-1 min-w-[15px] h-[15px] sm:min-w-[18px] sm:h-[18px] px-0.5 sm:px-1 bg-rose-500 text-white text-[8px] sm:text-[9px] font-black flex items-center justify-center rounded-full border-2 border-black shadow-[0_0_15px_rgba(244,63,94,0.8)] group-hover:scale-125 transition-transform"
               >
                 {unreadCount > 99 ? '99+' : unreadCount}
               </motion.span>
@@ -2866,7 +3301,7 @@ export default function App() {
                         <h1 className={`font-black text-sm tracking-tight leading-none ${darkMode ? 'text-white' : 'text-slate-900'}`}>BotFlow</h1>
                         <Sparkles className="w-2.5 h-2.5 text-emerald-500" />
                       </div>
-                      <span className="text-[6.5px] font-black text-emerald-500 tracking-[0.2em] uppercase block">Premium Edition</span>
+                      <span className="text-[6.5px] font-black text-emerald-500 tracking-[0.2em] uppercase block">v3.7 • Premium Edition</span>
                       {stats?.loginUser && (
                         <span className={`text-[8.5px] font-medium mt-0.5 ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>
                           {stats?.loginUser?.firstName || ''} {stats?.loginUser?.lastName || ''} {stats?.loginUser?.phone ? `(${stats?.loginUser?.phone})` : ''}
@@ -3218,6 +3653,20 @@ export default function App() {
               handleImportData={handleImportData}
               fileInputRef={fileInputRef}
               importing={importing}
+              onOpenDeleteLastImport={() => {
+                fetchLastImportInfo();
+                setShowDeleteLastKeywordConfirm(true);
+              }}
+              onOpenDeleteLastRule={() => {
+                fetchLastImportInfo();
+                setShowDeleteLastRuleConfirm(true);
+              }}
+              lastImportInfo={lastImportInfo}
+              importBatches={importBatches}
+              onDeleteBatch={(batchId, fileName, count) => setBatchToDelete({ batchId, fileName, count })}
+              isFetchingBatches={isFetchingBatches}
+              deletingBatchId={deletingBatchId}
+              onRefreshBatches={fetchImportBatches}
               handleUpdateSettings={handleUpdateSettings}
               handleForceUpdateAndPurge={handleForceUpdateAndPurge}
               saving={saving}
@@ -3788,6 +4237,140 @@ export default function App() {
               exit="exit"
               className="space-y-6 w-full"
             >
+              {/* ✨ AI Smart Keyword Suggestions (Feature 5) */}
+              <div className={`border p-8 rounded-[2.5rem] space-y-6 transition-colors duration-500 glow-blue relative overflow-hidden group ${darkMode ? 'bg-slate-900/60 border-blue-500/30' : 'bg-blue-50/40 border-blue-200 shadow-xl shadow-blue-500/5'}`}>
+                <div className={`absolute inset-0 pattern-grid opacity-[0.05] pointer-events-none ${darkMode ? 'text-blue-400' : 'text-blue-600'}`} />
+                <div className="relative z-10 space-y-6 pointer-events-auto">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center space-x-2">
+                      <div className={`p-1.5 rounded-lg ${darkMode ? 'bg-blue-500/20 text-blue-400' : 'bg-blue-500/10 text-blue-600'}`}>
+                        <Sparkles size={14} className="animate-pulse text-blue-400" />
+                      </div>
+                      <h3 className={`text-[10px] font-black uppercase tracking-widest ${darkMode ? 'text-blue-400' : 'text-blue-600'}`}>AI Keyword & Automation Assistant</h3>
+                    </div>
+                    <span className="px-2 py-0.5 rounded-full text-[8px] font-black uppercase bg-blue-500 text-white tracking-widest animate-pulse">Gemini 3.8-Flash</span>
+                  </div>
+
+                  <p className={`text-xs leading-relaxed ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>
+                    Let Gemini analyze your bot's recent message notifications and trigger logs to recommend optimized, ready-to-use smart auto-replies. Prevent manual study batch requests and boost conversion rates!
+                  </p>
+
+                  <button
+                    onClick={handleGenerateSuggestions}
+                    disabled={isGeneratingSuggestions}
+                    className={`w-full py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition flex items-center justify-center space-x-2 shadow-lg ${
+                      isGeneratingSuggestions 
+                        ? (darkMode ? 'bg-neutral-800 text-neutral-500' : 'bg-slate-200 text-slate-400') 
+                        : 'bg-blue-500 text-white hover:bg-blue-600 shadow-blue-500/20'
+                    }`}
+                  >
+                    {isGeneratingSuggestions ? (
+                      <>
+                        <RefreshCw className="animate-spin" size={16} />
+                        <span>Analyzing Log Trends...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles size={16} />
+                        <span>Generate Smart AI Suggestions</span>
+                      </>
+                    )}
+                  </button>
+
+                  {aiSuggestionsError && (
+                    <div className={`p-4 rounded-xl text-xs font-medium border ${darkMode ? 'bg-rose-500/10 border-rose-500/20 text-rose-400' : 'bg-rose-50 border-rose-200 text-rose-600'}`}>
+                      {aiSuggestionsError}
+                    </div>
+                  )}
+
+                  {aiSuggestions && aiSuggestions.length > 0 && (
+                    <div className="space-y-4 pt-2 animate-in fade-in slide-in-from-bottom-2 duration-500">
+                      <h4 className={`text-[9px] font-black uppercase tracking-widest ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>Recommended Automation Rules</h4>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        {aiSuggestions.map((sug, idx) => {
+                          const isAdded = addedSuggestions.includes(sug.keyword);
+                          return (
+                            <motion.div
+                              key={idx}
+                              initial={{ opacity: 0, y: 15 }}
+                              animate={{ opacity: 1, y: 0 }}
+                              transition={{ duration: 0.3, delay: idx * 0.05 }}
+                              className={`p-5 rounded-3xl border transition flex flex-col justify-between ${
+                                darkMode 
+                                  ? 'bg-neutral-950/60 border-white/5 hover:border-blue-500/20' 
+                                  : 'bg-white border-slate-100 hover:border-blue-300 shadow-sm'
+                              }`}
+                            >
+                              <div className="space-y-3">
+                                <div className="flex items-center justify-between gap-2 flex-wrap">
+                                  <span className={`px-2 py-0.5 rounded-lg text-[9px] font-black uppercase tracking-wider ${
+                                    darkMode ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20' : 'bg-blue-50 text-blue-600 border border-blue-100'
+                                  }`}>
+                                    {sug.category}
+                                  </span>
+                                  <span className={`text-[9px] font-mono opacity-60 ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+                                    Matches: partial
+                                  </span>
+                                </div>
+
+                                <div className="space-y-1">
+                                  <div className={`text-xs font-black ${darkMode ? 'text-slate-200' : 'text-slate-800'}`}>
+                                    Trigger: <span className="text-blue-500">"{sug.keyword}"</span>
+                                  </div>
+                                  {sug.keywords && sug.keywords.length > 0 && (
+                                    <div className="flex flex-wrap gap-1">
+                                      {sug.keywords.map((syn: string, synIdx: number) => (
+                                        <span key={synIdx} className={`text-[8.5px] font-medium px-1.5 py-0.25 rounded ${darkMode ? 'bg-white/5 text-slate-400' : 'bg-slate-100 text-slate-500'}`}>
+                                          {syn}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+
+                                <div className={`p-3 rounded-2xl border text-xs whitespace-pre-wrap leading-relaxed ${
+                                  darkMode ? 'bg-black/40 border-white/5 text-slate-300' : 'bg-slate-50 border-slate-100 text-slate-600'
+                                }`}>
+                                  {sug.reply}
+                                </div>
+
+                                <p className={`text-[10px] italic leading-normal ${darkMode ? 'text-slate-500' : 'text-slate-400'}`}>
+                                  💡 {sug.explanation}
+                                </p>
+                              </div>
+
+                              <div className="pt-4 mt-auto">
+                                <button
+                                  onClick={() => handleAddSuggestedKeyword(sug)}
+                                  disabled={isAdded}
+                                  className={`w-full py-3 rounded-xl font-black uppercase tracking-widest text-[9px] transition flex items-center justify-center space-x-1.5 ${
+                                    isAdded 
+                                      ? 'bg-emerald-500 text-white cursor-default' 
+                                      : (darkMode ? 'bg-blue-500/20 text-blue-400 hover:bg-blue-500 hover:text-white border border-blue-500/30' : 'bg-blue-50 text-blue-600 hover:bg-blue-500 hover:text-white border border-blue-200')
+                                  }`}
+                                >
+                                  {isAdded ? (
+                                    <>
+                                      <Check size={12} />
+                                      <span>Rule Added to Bot</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Plus size={12} />
+                                      <span>Add to Bot Rules</span>
+                                    </>
+                                  )}
+                                </button>
+                              </div>
+                            </motion.div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+
               <div className={`border p-8 rounded-[2.5rem] space-y-6 transition-colors duration-500 glow-rose relative overflow-hidden group ${darkMode ? 'bg-rose-950/40 border-rose-500/30' : 'bg-rose-50 border-rose-200 shadow-xl shadow-rose-500/10'}`}>
                 <div className={`absolute inset-0 pattern-dots opacity-[0.05] pointer-events-none ${darkMode ? 'text-rose-400' : 'text-rose-600'}`} />
                 <div className="relative z-10 space-y-6 pointer-events-auto">
@@ -4465,7 +5048,7 @@ export default function App() {
         )}
       </AnimatePresence>
 
-      {/* Delete Last Keyword Confirmation Modal */}
+      {/* Delete Last Import Confirmation Modal (Whole File Batch) */}
       <AnimatePresence>
         {showDeleteLastKeywordConfirm && (
           <motion.div
@@ -4475,43 +5058,208 @@ export default function App() {
             className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/60 backdrop-blur-md"
           >
             <motion.div
-              initial={{ scale: 0.8, opacity: 0, y: 20 }}
+              initial={{ scale: 0.85, opacity: 0, y: 20 }}
               animate={{ scale: 1, opacity: 1, y: 0 }}
-              exit={{ scale: 0.8, opacity: 0, y: 20 }}
-              className={`w-full max-w-sm p-8 rounded-[2.5rem] shadow-2xl border relative overflow-hidden ${
+              exit={{ scale: 0.85, opacity: 0, y: 20 }}
+              className={`w-full max-w-sm p-6 sm:p-7 rounded-[2rem] shadow-2xl border relative overflow-hidden ${
                 darkMode ? 'bg-neutral-900 border-neutral-800' : 'bg-white border-slate-100'
               }`}
             >
-              <div className="absolute -top-10 -right-10 w-32 h-32 rounded-full blur-3xl opacity-20 bg-orange-500" />
+              <div className="absolute -top-10 -right-10 w-32 h-32 rounded-full blur-3xl opacity-20 bg-rose-500" />
               
               <div className="relative z-10 text-center">
-                <div className={`w-20 h-20 rounded-3xl flex items-center justify-center mx-auto mb-6 transition-transform duration-500 hover:rotate-12 ${
-                  darkMode ? 'bg-orange-500/20 text-orange-400' : 'bg-orange-50 text-orange-600'
+                <div className={`w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-4 transition-transform duration-500 hover:rotate-12 ${
+                  darkMode ? 'bg-rose-500/20 text-rose-400' : 'bg-rose-50 text-rose-600'
                 }`}>
-                  <Trash2 size={40} />
+                  <Trash2 size={32} />
                 </div>
                 
-                <h3 className={`text-2xl font-black tracking-tight mb-3 ${darkMode ? 'text-white' : 'text-slate-900'}`}>
-                  Delete Last?
+                <h3 className={`text-xl font-black tracking-tight mb-2 ${darkMode ? 'text-white' : 'text-slate-900'}`}>
+                  Delete Last Imported JSON File?
                 </h3>
-                <p className={`text-sm mb-8 leading-relaxed ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>
-                  Are you sure you want to remove the most recently imported keyword?
+                <p className={`text-xs mb-4 leading-relaxed ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+                  {lastImportInfo?.count 
+                    ? `Are you sure you want to permanently delete ALL ${lastImportInfo.count} rules from your most recent imported JSON file? Sabhi ${lastImportInfo.count} rules ek sath delete ho jayenge.`
+                    : 'Are you sure you want to permanently delete all rules from your last imported JSON file at once?'}
                 </p>
+
+                {lastImportInfo?.importedAt && (
+                  <div className={`mb-5 p-2.5 rounded-xl border text-[11px] text-left ${
+                    darkMode ? 'bg-neutral-800/60 border-neutral-700/60 text-slate-300' : 'bg-slate-50 border-slate-200 text-slate-600'
+                  }`}>
+                    <div className="flex justify-between items-center mb-1">
+                      <span className="font-semibold text-rose-500">Import Date:</span>
+                      <span className="font-mono text-[10px]">{new Date(lastImportInfo.importedAt).toLocaleString()}</span>
+                    </div>
+                    {lastImportInfo?.count ? (
+                      <div className="flex justify-between items-center">
+                        <span className="font-semibold text-slate-400">Total Rules in File:</span>
+                        <span className="font-bold text-rose-400">{lastImportInfo.count} Rules</span>
+                      </div>
+                    ) : null}
+                  </div>
+                )}
                 
-                <div className="flex flex-col space-y-3">
+                <div className="flex flex-col space-y-2.5">
                   <button
-                    onClick={async () => {
-                      await fetch("/api/data/last-import", { method: "DELETE" });
-                      setShowDeleteLastKeywordConfirm(false);
-                      window.location.reload();
-                    }}
-                    className="w-full py-4 rounded-2xl font-black uppercase tracking-widest text-xs text-white bg-orange-500 hover:bg-orange-600 shadow-xl shadow-orange-500/20 transition"
+                    disabled={deletingLastImport}
+                    onClick={handleDeleteLastImport}
+                    className="w-full py-3.5 rounded-xl font-bold uppercase tracking-wider text-xs text-white bg-rose-600 hover:bg-rose-700 active:scale-98 disabled:opacity-50 shadow-lg shadow-rose-600/20 transition flex items-center justify-center space-x-2"
                   >
-                    Confirm Delete
+                    {deletingLastImport ? (
+                      <>
+                        <RefreshCw size={14} className="animate-spin" />
+                        <span>Deleting All Rules...</span>
+                      </>
+                    ) : (
+                      <span>Delete Entire File ({lastImportInfo?.count || 'All'} Rules)</span>
+                    )}
                   </button>
                   <button
+                    disabled={deletingLastImport}
                     onClick={() => setShowDeleteLastKeywordConfirm(false)}
-                    className={`w-full py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition ${
+                    className={`w-full py-3 rounded-xl font-bold uppercase tracking-wider text-xs transition ${
+                      darkMode ? 'bg-neutral-800 text-neutral-300 hover:bg-neutral-700' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                    }`}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Delete Last 1 Rule Confirmation Modal (Single Rule) */}
+      <AnimatePresence>
+        {showDeleteLastRuleConfirm && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/60 backdrop-blur-md"
+          >
+            <motion.div
+              initial={{ scale: 0.85, opacity: 0, y: 20 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.85, opacity: 0, y: 20 }}
+              className={`w-full max-w-sm p-6 sm:p-7 rounded-[2rem] shadow-2xl border relative overflow-hidden ${
+                darkMode ? 'bg-neutral-900 border-neutral-800' : 'bg-white border-slate-100'
+              }`}
+            >
+              <div className="absolute -top-10 -right-10 w-32 h-32 rounded-full blur-3xl opacity-20 bg-amber-500" />
+              
+              <div className="relative z-10 text-center">
+                <div className={`w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-4 transition-transform duration-500 hover:rotate-12 ${
+                  darkMode ? 'bg-amber-500/20 text-amber-400' : 'bg-amber-50 text-amber-600'
+                }`}>
+                  <Trash2 size={32} />
+                </div>
+                
+                <h3 className={`text-xl font-black tracking-tight mb-2 ${darkMode ? 'text-white' : 'text-slate-900'}`}>
+                  Delete Last 1 Rule?
+                </h3>
+                <p className={`text-xs mb-4 leading-relaxed ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+                  Are you sure you want to delete only the single most recently added or imported rule? (Sirf 1 aakhri rule delete hoga).
+                </p>
+
+                {lastImportInfo?.latestRuleName && (
+                  <div className={`mb-5 p-2.5 rounded-xl border text-[11px] text-left ${
+                    darkMode ? 'bg-neutral-800/60 border-neutral-700/60 text-slate-300' : 'bg-slate-50 border-slate-200 text-slate-600'
+                  }`}>
+                    <div className="flex justify-between items-center">
+                      <span className="font-semibold text-amber-500">Target Rule:</span>
+                      <span className="font-mono text-[11px] font-bold text-amber-400 truncate max-w-[170px]">
+                        "{lastImportInfo.latestRuleName}"
+                      </span>
+                    </div>
+                  </div>
+                )}
+                
+                <div className="flex flex-col space-y-2.5">
+                  <button
+                    disabled={deletingLastRule}
+                    onClick={handleDeleteLastRule}
+                    className="w-full py-3.5 rounded-xl font-bold uppercase tracking-wider text-xs text-white bg-amber-600 hover:bg-amber-700 active:scale-98 disabled:opacity-50 shadow-lg shadow-amber-600/20 transition flex items-center justify-center space-x-2"
+                  >
+                    {deletingLastRule ? (
+                      <>
+                        <RefreshCw size={14} className="animate-spin" />
+                        <span>Deleting Rule...</span>
+                      </>
+                    ) : (
+                      <span>Delete Last 1 Rule</span>
+                    )}
+                  </button>
+                  <button
+                    disabled={deletingLastRule}
+                    onClick={() => setShowDeleteLastRuleConfirm(false)}
+                    className={`w-full py-3 rounded-xl font-bold uppercase tracking-wider text-xs transition ${
+                      darkMode ? 'bg-neutral-800 text-neutral-300 hover:bg-neutral-700' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                    }`}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Delete Specific Imported Batch Confirmation Modal */}
+      <AnimatePresence>
+        {batchToDelete && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/60 backdrop-blur-md"
+          >
+            <motion.div
+              initial={{ scale: 0.85, opacity: 0, y: 20 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.85, opacity: 0, y: 20 }}
+              className={`w-full max-w-sm p-6 sm:p-7 rounded-[2rem] shadow-2xl border relative overflow-hidden ${
+                darkMode ? 'bg-neutral-900 border-neutral-800' : 'bg-white border-slate-100'
+              }`}
+            >
+              <div className="absolute -top-10 -right-10 w-32 h-32 rounded-full blur-3xl opacity-20 bg-rose-500" />
+              
+              <div className="relative z-10 text-center">
+                <div className={`w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-4 transition-transform duration-500 hover:rotate-12 ${
+                  darkMode ? 'bg-rose-500/20 text-rose-400' : 'bg-rose-50 text-rose-600'
+                }`}>
+                  <Trash2 size={32} />
+                </div>
+                
+                <h3 className={`text-xl font-black tracking-tight mb-2 ${darkMode ? 'text-white' : 'text-slate-900'}`}>
+                  Delete Imported File Batch?
+                </h3>
+                <p className={`text-xs mb-4 leading-relaxed ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+                  Are you sure you want to permanently delete <span className="font-bold text-white">"{batchToDelete.fileName}"</span> and all its {batchToDelete.count} rules?
+                </p>
+
+                <div className="flex flex-col space-y-2.5">
+                  <button
+                    disabled={deletingBatchId === batchToDelete.batchId}
+                    onClick={() => handleDeleteImportBatch(batchToDelete.batchId)}
+                    className="w-full py-3.5 rounded-xl font-bold uppercase tracking-wider text-xs text-white bg-rose-600 hover:bg-rose-700 active:scale-98 disabled:opacity-50 shadow-lg shadow-rose-600/20 transition flex items-center justify-center space-x-2"
+                  >
+                    {deletingBatchId === batchToDelete.batchId ? (
+                      <>
+                        <RefreshCw size={14} className="animate-spin" />
+                        <span>Deleting File...</span>
+                      </>
+                    ) : (
+                      <span>Delete File & {batchToDelete.count} Rules</span>
+                    )}
+                  </button>
+                  <button
+                    disabled={deletingBatchId === batchToDelete.batchId}
+                    onClick={() => setBatchToDelete(null)}
+                    className={`w-full py-3 rounded-xl font-bold uppercase tracking-wider text-xs transition ${
                       darkMode ? 'bg-neutral-800 text-neutral-300 hover:bg-neutral-700' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
                     }`}
                   >

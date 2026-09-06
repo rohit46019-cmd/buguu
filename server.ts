@@ -7,7 +7,7 @@ import webpush from "web-push";
 import { NewMessage } from "telegram/events/index.js";
 import { StringSession } from "telegram/sessions/index.js";
 import { CustomFile } from "telegram/client/uploads.js";
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, Type } from "@google/genai";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -822,6 +822,8 @@ const KeywordSchema = new mongoose.Schema({
   target_groups: { type: [String], default: [] }, // Target group IDs or titles
   enabled: { type: Boolean, default: true },
   notify_on_hit: { type: Boolean, default: false },
+  last_import_batch_id: { type: String, default: null, index: true },
+  created_at: { type: Date, default: Date.now },
   account_id: { type: String, default: "default", index: true }
 });
 const Keyword = mongoose.model("Keyword", KeywordSchema);
@@ -942,10 +944,134 @@ const PushSubscriptionSchema = new mongoose.Schema({
     p256dh: { type: String, required: true },
     auth: { type: String, required: true }
   },
+  device_id: { type: String, default: "", index: true },
+  device_name: { type: String, default: "" },
+  ip_address: { type: String, default: "" },
   account_id: { type: String, default: "default", index: true },
+  push_scope: { type: String, default: "current" }, // 'current' or 'all'
+  last_active: { type: Date, default: Date.now },
   created_at: { type: Date, default: Date.now }
 });
 const PushSubscription = mongoose.model("PushSubscription", PushSubscriptionSchema);
+
+const DeviceSessionSchema = new mongoose.Schema({
+  device_id: { type: String, required: true, unique: true, index: true },
+  ip_address: { type: String, default: "" },
+  user_agent: { type: String, default: "" },
+  device_name: { type: String, default: "Device" },
+  platform: { type: String, default: "Mobile" },
+  account_id: { type: String, default: "default", index: true },
+  account_name: { type: String, default: "Main Profile" },
+  has_push: { type: Boolean, default: false },
+  endpoint: { type: String, default: "" },
+  keys: {
+    p256dh: { type: String, default: "" },
+    auth: { type: String, default: "" }
+  },
+  last_active: { type: Date, default: Date.now },
+  created_at: { type: Date, default: Date.now }
+});
+const DeviceSession = mongoose.model("DeviceSession", DeviceSessionSchema);
+
+export function getClientIp(req: any): string {
+  if (!req) return '127.0.0.1';
+  const forwarded = req.headers?.['x-forwarded-for'];
+  if (typeof forwarded === 'string') {
+    return forwarded.split(',')[0].trim().replace('::ffff:', '');
+  }
+  if (Array.isArray(forwarded) && forwarded.length > 0) {
+    return forwarded[0].trim().replace('::ffff:', '');
+  }
+  const raw = req.socket?.remoteAddress || req.ip || '127.0.0.1';
+  return String(raw).replace('::ffff:', '');
+}
+
+export function parseDeviceInfo(userAgent: string = '', customName: string = ''): { deviceName: string; platform: string } {
+  let platform = 'Unknown';
+  let browser = 'Browser';
+  
+  if (/android/i.test(userAgent)) platform = 'Android';
+  else if (/iphone|ipad|ipod/i.test(userAgent)) platform = 'iOS';
+  else if (/windows/i.test(userAgent)) platform = 'Windows';
+  else if (/macintosh|mac os x/i.test(userAgent)) platform = 'macOS';
+  else if (/linux/i.test(userAgent)) platform = 'Linux';
+
+  if (/chrome|crios/i.test(userAgent) && !/edge|opr/i.test(userAgent)) browser = 'Chrome';
+  else if (/safari/i.test(userAgent) && !/chrome/i.test(userAgent)) browser = 'Safari';
+  else if (/firefox|fxios/i.test(userAgent)) browser = 'Firefox';
+  else if (/edg/i.test(userAgent)) browser = 'Edge';
+  else if (/opera|opr/i.test(userAgent)) browser = 'Opera';
+
+  const defaultName = `${platform} (${browser})`;
+  return {
+    deviceName: customName && customName.trim() ? customName.trim() : defaultName,
+    platform
+  };
+}
+
+export async function trackDeviceActivity(req: any, deviceIdInput?: string, accountIdInput?: string) {
+  try {
+    const deviceId = (deviceIdInput || req.headers?.['x-device-id'] || req.body?.deviceId || req.query?.deviceId || '') as string;
+    if (!deviceId || deviceId.trim() === '') return null;
+
+    const accountId = (accountIdInput || getAccountId(req) || 'default') as string;
+    const ip = getClientIp(req);
+    const ua = (req.headers?.['user-agent'] || '') as string;
+    const { deviceName, platform } = parseDeviceInfo(ua, (req.headers?.['x-device-name'] || req.body?.deviceName || '') as string);
+
+    let accountName = "Main Profile";
+    if (accountId === 'default') {
+      const p = await AccountProfile.findOne({ is_main: true });
+      if (p?.name) accountName = p.name;
+    } else {
+      const p = await AccountProfile.findOne({ account_id: accountId });
+      if (p?.name) accountName = p.name;
+    }
+
+    const updated = await DeviceSession.findOneAndUpdate(
+      { device_id: deviceId },
+      {
+        device_id: deviceId,
+        ip_address: ip,
+        user_agent: ua,
+        device_name: deviceName,
+        platform: platform,
+        account_id: accountId,
+        account_name: accountName,
+        last_active: new Date()
+      },
+      { upsert: true, new: true }
+    );
+    return updated;
+  } catch (e) {
+    return null;
+  }
+}
+
+const ImportBatchSchema = new mongoose.Schema({
+  account_id: { type: String, default: "default", index: true },
+  batch_id: { type: String, required: true, index: true },
+  file_name: { type: String, default: "" },
+  imported_at: { type: Date, default: Date.now },
+  keyword_ids: { type: [mongoose.Schema.Types.ObjectId], default: [] },
+  keyword_names: { type: [String], default: [] },
+  count: { type: Number, default: 0 }
+});
+const ImportBatch = mongoose.model("ImportBatch", ImportBatchSchema);
+
+const AccountProfileSchema = new mongoose.Schema({
+  account_id: { type: String, required: true, unique: true, index: true },
+  name: { type: String, required: true },
+  avatar_color: { type: String, default: 'from-blue-600 to-indigo-600' },
+  is_main: { type: Boolean, default: false },
+  lock_pin: { type: String, default: '' },
+  phone: { type: String, default: '' },
+  telegram_name: { type: String, default: '' },
+  telegram_username: { type: String, default: '' },
+  created_at: { type: Date, default: Date.now },
+  updated_at: { type: Date, default: Date.now }
+});
+const AccountProfile = mongoose.model("AccountProfile", AccountProfileSchema);
 
 // Helper functions
 const escapeRegExp = (string: string) => string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -996,7 +1122,10 @@ export function removeBlockedTopicFromCache(topicId: number, accountId: string =
 
 export function getCachedSetting(key: string, accountId: string = 'default'): string {
   const acc = accountId || 'default';
-  const val = settingsCache[acc]?.[key] || "";
+  let val = settingsCache[acc]?.[key];
+  if (val === undefined || val === null) {
+    val = settingsCache['default']?.[key] || "";
+  }
   return typeof val === 'string' ? val : "";
 }
 
@@ -1059,6 +1188,9 @@ const getSetting = async (key: string, accountId: string = "default") => {
     setting = await Setting.findOne({ key, ...getAccountFilter('default') });
   } else {
     setting = await Setting.findOne({ key, account_id: acc });
+    if (!setting) {
+      setting = await Setting.findOne({ key, ...getAccountFilter('default') });
+    }
   }
   if (setting) {
     settingsCache[acc][key] = setting.value;
@@ -1103,7 +1235,13 @@ const deleteSetting = async (key: string, accountId: string = "default") => {
 // Helper: Parse and normalize target group IDs configured in Settings
 export function parseRegisteredGroups(settingValue?: string, accountId: string = "default"): { id: string; normalizedId: string; title: string }[] {
   const acc = accountId || "default";
-  const raw = settingValue !== undefined ? settingValue : (settingsCache[acc]?.["telegram_group_ids"] || settingsCache[acc]?.["target_group_id"] || (acc === 'default' ? process.env.TELEGRAM_GROUP_ID : "") || "");
+  const raw = settingValue !== undefined ? settingValue : (
+    settingsCache[acc]?.["telegram_group_ids"] || 
+    settingsCache[acc]?.["target_group_id"] || 
+    settingsCache['default']?.["telegram_group_ids"] || 
+    settingsCache['default']?.["target_group_id"] || 
+    (process.env.TELEGRAM_GROUP_ID || "")
+  );
   if (!raw || !raw.trim()) return [];
 
   const items = raw.split(/[\n,;]+/).map(s => s.trim()).filter(Boolean);
@@ -1567,7 +1705,13 @@ let broadcastStatus = {
 
 function sendSseEvent(type: string, data: any) {
   const payload = JSON.stringify({ type, data });
+  const eventAccountId = data?.accountId || data?.account_id;
+
   sseClients = sseClients.filter(client => {
+    // If the event is specific to an account, and the client is subscribed to a different account, skip it
+    if (eventAccountId && client.accountId && client.accountId !== eventAccountId) {
+      return true; // Keep client, but do not send this message
+    }
     try {
       client.res.write(`data: ${payload}\n\n`);
       return true;
@@ -1577,25 +1721,151 @@ function sendSseEvent(type: string, data: any) {
   });
 }
 
-// Helper to send push notifications to all subscribers
-async function sendPushNotification(title: string, body: string, data: any = {}) {
+async function aiEnhancePushNotification(title: string, body: string, accountId?: string): Promise<{ title: string; body: string }> {
   try {
-    const subscriptions = await PushSubscription.find();
-    if (subscriptions.length === 0) {
-      console.log(`[Push] No subscribers registered yet.`);
-      return;
+    const aiAutoMode = (await getSetting("ai_push_auto_mode", accountId))?.value === "true";
+    if (!aiAutoMode) {
+      return { title, body };
     }
-    console.log(`Sending push notification to ${subscriptions.length} subscribers.`);
-    subscriptions.forEach(sub => console.log(`- Subscriber endpoint: ${sub.endpoint.substring(0, 30)}...`));
-    const payload = JSON.stringify({ 
-      title, 
-      body, 
-      url: data.url || '/',
-      tag: data.tag || `botflow-${Date.now()}`,
-      timestamp: Date.now(),
-      data 
+
+    const geminiApiKeysSetting = await getSetting("gemini_api_keys", accountId) || await getSetting("gemini_api_keys");
+    let apiKeys: string[] = [];
+    try { apiKeys = JSON.parse(geminiApiKeysSetting?.value || "[]"); } catch (e) {}
+    const envKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
+    if (envKey && !apiKeys.includes(envKey)) apiKeys.push(envKey);
+
+    if (apiKeys.length === 0) {
+      return { title, body };
+    }
+
+    for (const apiKey of apiKeys) {
+      try {
+        const genAI = new GoogleGenAI({ apiKey });
+        const response = await genAI.models.generateContent({
+          model: "gemini-3-flash-preview",
+          contents: [
+            {
+              role: "user",
+              parts: [
+                {
+                  text: `You are an AI notification assistant for an automated Telegram bot store. Enhance and summarize this push notification to be punchy, professional, and urgent. 
+Original Title: "${title}"
+Original Body: "${body}"
+
+Return JSON strictly in this format:
+{
+  "title": "Enhanced Punchy Title",
+  "body": "Enhanced Actionable Summary Body"
+}`
+                }
+              ]
+            }
+          ],
+          config: {
+            responseMimeType: "application/json"
+          }
+        });
+
+        const text = response.text();
+        if (text) {
+          const parsed = JSON.parse(text);
+          if (parsed.title && parsed.body) {
+            return { title: parsed.title, body: parsed.body };
+          }
+        }
+      } catch (err) {
+        // try next key
+      }
+    }
+  } catch (e) {
+    console.error("AI Push Enhancement error:", e);
+  }
+  return { title, body };
+}
+
+// Helper to send push notifications to subscribers of a specific account or broadcast across all active devices
+async function sendPushNotification(title: string, body: string, data: any = {}, accountId?: string) {
+  try {
+    const accId = accountId || 'default';
+    
+    // Enhance notification using AI Auto Mode if enabled
+    const enhanced = await aiEnhancePushNotification(title, body, accId);
+    const finalTitle = enhanced.title;
+    const finalBody = enhanced.body;
+
+    // Fetch active push subscriptions for the specific account or if scope is 'all'
+    const allSubs = await PushSubscription.find({
+      $or: [
+        { account_id: accId },
+        { push_scope: "all" }
+      ]
     });
     
+    // Fetch device tracking sessions to map IPs, devices, and logged-in accounts
+    const allDevices = await DeviceSession.find({}).sort({ last_active: -1 });
+    const deviceMap = new Map<string, any>();
+    allDevices.forEach(d => {
+      if (d.device_id) deviceMap.set(d.device_id, d);
+      if (d.endpoint) deviceMap.set(d.endpoint, d);
+    });
+
+    // De-duplicate subscriptions by endpoint
+    const uniqueMap = new Map();
+    for (const sub of allSubs) {
+      if (sub && sub.endpoint && sub.keys && sub.keys.p256dh && sub.keys.auth) {
+        uniqueMap.set(sub.endpoint, sub);
+      }
+    }
+    const subscriptions = Array.from(uniqueMap.values());
+    
+    // Always broadcast SSE event so active clients receive it instantly
+    sendSseEvent('push_broadcast', {
+      title: finalTitle,
+      message: finalBody,
+      timestamp: Date.now(),
+      accountId: accId
+    });
+
+    if (subscriptions.length === 0) {
+      console.log(`[Push] No subscribers registered yet in database. SSE broadcast sent.`);
+      return;
+    }
+
+    // Trace which devices and IP addresses are registered and receiving this notification
+    const dispatchDetails: { deviceId: string; deviceName: string; ip: string; loggedAccount: string }[] = [];
+    
+    subscriptions.forEach(sub => {
+      const dev = (sub.device_id ? deviceMap.get(sub.device_id) : null) || deviceMap.get(sub.endpoint);
+      const ip = dev?.ip_address || sub.ip_address || 'IP Traced';
+      const devName = dev?.device_name || sub.device_name || 'Mobile/Browser';
+      const devAcc = dev?.account_id || sub.account_id || 'default';
+      const devAccName = dev?.account_name || (devAcc === 'default' ? 'Main Profile' : devAcc);
+      dispatchDetails.push({
+        deviceId: sub.device_id || dev?.device_id || 'Device',
+        deviceName: devName,
+        ip,
+        loggedAccount: `${devAccName} (${devAcc})`
+      });
+    });
+
+    const summaryIpList = dispatchDetails.map(d => `${d.deviceName} [IP: ${d.ip}] (Logged: ${d.loggedAccount})`).join(' | ');
+    console.log(`[Push Dispatch] 🚀 Broadcasting push to ${subscriptions.length} device(s): ${summaryIpList} | Title: "${title}"`);
+    
+    const payload = JSON.stringify({ 
+      title: finalTitle, 
+      body: finalBody, 
+      url: data.url || '/',
+      tag: data.tag || 'botflow-alert',
+      timestamp: Date.now(),
+      badge: '/pwa-192x192.png',
+      icon: '/pwa-192x192.png',
+      data: {
+        ...data,
+        targetAccountId: accId
+      }
+    });
+    
+    let sentCount = 0;
     const promises = subscriptions.map(sub => {
       const subscription = {
         endpoint: sub.endpoint,
@@ -1607,22 +1877,33 @@ async function sendPushNotification(title: string, body: string, data: any = {})
       
       return webpush.sendNotification(subscription, payload, {
         TTL: 86400,
-        urgency: 'high',
-        topic: 'botflow-alerts'
+        urgency: 'high'
+      }).then(() => {
+        sentCount++;
+        console.log(`[Push] Successfully sent push notification to device: ${sub.endpoint.substring(0, 30)}...`);
       }).catch(async (err: any) => {
-        if (err.statusCode === 404 || err.statusCode === 410) {
+        if (err && (err.statusCode === 404 || err.statusCode === 410)) {
           // Subscription expired or no longer valid
-          await PushSubscription.deleteOne({ endpoint: sub.endpoint });
-          console.log(`Deleted expired push subscription: ${sub.endpoint}`);
+          try {
+            await PushSubscription.deleteOne({ endpoint: sub.endpoint });
+            await DeviceSession.updateOne({ endpoint: sub.endpoint }, { has_push: false });
+            console.log(`Deleted expired push subscription: ${sub.endpoint}`);
+          } catch (delErr) {
+            console.error("Error deleting expired subscription:", delErr);
+          }
         } else {
-          console.error(`Error sending push notification to ${sub.endpoint}:`, err.message);
+          console.error(`Error sending push notification to ${sub.endpoint}:`, err ? err.message : err);
         }
       });
     });
     
     await Promise.all(promises);
-  } catch (err) {
+    if (sentCount > 0) {
+      saveLog(`Web Push: Dispatched "${title}" to ${sentCount} device(s) [${summaryIpList}]`, "info", "Push", undefined, undefined, accId).catch(() => {});
+    }
+  } catch (err: any) {
     console.error("Error in sendPushNotification:", err);
+    saveLog(`Web Push delivery failed: ${err.message}`, "error", "Push", undefined, undefined, accountId || 'default').catch(() => {});
   }
 }
 
@@ -1649,14 +1930,14 @@ export async function sendPhotoReceivedNotification(params: {
   client?: any;
   accountId?: string;
 }) {
-  const { chatTitle, topicName, topicId, chatId, link, accountId = "default" } = params;
+  const { chatTitle, topicName, topicId, chatId, link, client, accountId = "default" } = params;
   const messageText = `📸 ${chatTitle} - ${topicName} sent a photo`;
 
-  // 1. Web Push Notification to background app/browser
+  // 1. Web Push Notification to background app/browser (Phone Notification Panel)
   sendPushNotification("Photo Received 📷", messageText, { 
     url: link || '/',
     tag: `photo-${Date.now()}`
-  }).catch(e => console.error("WebPush photo error:", e));
+  }, accountId).catch(e => console.error("WebPush photo error:", e));
 
   // 2. Real-time SSE event for dashboard UI and sound alert
   sendSseEvent('photo_received', {
@@ -1670,10 +1951,22 @@ export async function sendPhotoReceivedNotification(params: {
     url: link
   });
 
-  // 3. Telegram Bot alert to admin chats ONLY with inline button system
+  // 3. Telegram Bot alert directly to user & admins (Bot Notification)
   if (bot) {
     try {
       const adminChats = await getBotAdminChatIds();
+      
+      // Auto-detect user's own Chat ID via client to ensure direct private delivery
+      let ownChatId: string | null = null;
+      if (client) {
+        try {
+          const me = await client.getMe().catch(() => null);
+          if (me && me.id) {
+            ownChatId = me.id.toString();
+          }
+        } catch (e) {}
+      }
+
       const cleanChatId = (chatId || "").toString().replace(/^-100|^ -100|^-/, "").trim();
       const topicLink = link || (topicId ? `https://t.me/c/${cleanChatId}/${topicId}` : `https://t.me/c/${cleanChatId}`);
       const botAlertText = `📸 <b>New Photo Received!</b>\n\n` +
@@ -1689,8 +1982,19 @@ export async function sendPhotoReceivedNotification(params: {
         ]
       };
 
-      for (const adminChat of adminChats) {
-        bot.sendMessage(adminChat, botAlertText, { parse_mode: 'HTML', reply_markup: replyMarkup }).catch(() => {});
+      const targetChats = new Set(adminChats);
+      if (ownChatId) {
+        targetChats.add(ownChatId);
+      }
+
+      for (const targetChat of targetChats) {
+        if (!targetChat) continue;
+        await bot.sendMessage(targetChat, botAlertText, { parse_mode: 'HTML', reply_markup: replyMarkup })
+          .catch(async (e) => {
+            console.warn(`[NOTIFY] HTML Bot photo send failed to ${targetChat}, sending plain:`, e.message);
+            const plainText = `📸 New Photo Received!\nGroup: ${chatTitle}\nTopic: ${topicName}`;
+            await bot.sendMessage(targetChat, plainText, { reply_markup: replyMarkup }).catch(() => {});
+          });
       }
     } catch (botErr: any) {
       console.error("[NOTIFY] Failed to send Bot admin photo notification:", botErr.message);
@@ -1711,16 +2015,19 @@ export async function sendKeywordHitNotification(params: {
   client?: any;
   accountId?: string;
 }) {
-  const { matchedWord, topicName, topicId, chatTitle, chatId, userMessage, accountId = "default" } = params;
+  const { matchedWord, topicName, topicId, chatTitle, chatId, userMessage, client, accountId = "default" } = params;
   const cleanChatId = (chatId || "").toString().replace(/^-100|^ -100|^-/, "").trim();
   const topicLink = topicId ? `https://t.me/c/${cleanChatId}/${topicId}` : `https://t.me/c/${cleanChatId}`;
   const notifyBody = `Matched "${matchedWord}" in "${topicName}" (${chatTitle})`;
 
-  // 1. Web Push Notification to background app/browser
-  sendPushNotification("Keyword Triggered! 🎯", notifyBody, { 
+  // 1. Web Push Notification directly to user's phone Notification Panel
+  const pushTitle = `🎯 ${topicName || 'General'} - Keyword Hit!`;
+  const pushBody = `Keyword: "${matchedWord}"\nGroup: ${chatTitle}${userMessage ? `\n"${userMessage.length > 60 ? userMessage.substring(0, 60) + '...' : userMessage}"` : ''}`;
+
+  sendPushNotification(pushTitle, pushBody, { 
     url: topicLink || '/',
     tag: `keyword-${Date.now()}`
-  }).catch(e => console.error("WebPush error:", e));
+  }, accountId).catch(e => console.error("WebPush error:", e));
 
   // 2. Real-time SSE event for dashboard UI
   sendSseEvent('keyword_hit_notify', {
@@ -1734,10 +2041,22 @@ export async function sendKeywordHitNotification(params: {
     accountId
   });
 
-  // 3. Telegram Bot alert to admin chats ONLY with inline button system
+  // 3. Telegram Bot alert directly to user & admins (Bot Notification)
   if (bot) {
     try {
       const adminChats = await getBotAdminChatIds();
+
+      // Auto-detect user's own Chat ID via client to ensure direct private delivery
+      let ownChatId: string | null = null;
+      if (client) {
+        try {
+          const me = await client.getMe().catch(() => null);
+          if (me && me.id) {
+            ownChatId = me.id.toString();
+          }
+        } catch (e) {}
+      }
+
       const botAlertText = `🎯 <b>Keyword Hit Alert!</b>\n\n` +
         `• <b>Keyword:</b> <code>${escapeHtml(matchedWord)}</code>\n` +
         `• <b>Topic:</b> ${escapeHtml(topicName)} (ID: <code>${topicId || 'General'}</code>)\n` +
@@ -1753,8 +2072,19 @@ export async function sendKeywordHitNotification(params: {
         ]
       };
 
-      for (const adminChat of adminChats) {
-        bot.sendMessage(adminChat, botAlertText, { parse_mode: 'HTML', reply_markup: replyMarkup }).catch(() => {});
+      const targetChats = new Set(adminChats);
+      if (ownChatId) {
+        targetChats.add(ownChatId);
+      }
+
+      for (const targetChat of targetChats) {
+        if (!targetChat) continue;
+        await bot.sendMessage(targetChat, botAlertText, { parse_mode: 'HTML', reply_markup: replyMarkup })
+          .catch(async (e) => {
+            console.warn(`[NOTIFY] HTML Bot keyword send failed to ${targetChat}, sending plain:`, e.message);
+            const plainText = `🎯 Keyword Hit Alert!\nKeyword: ${matchedWord}\nTopic: ${topicName}\nGroup: ${chatTitle}\nMessage: ${userMessage || ''}`;
+            await bot.sendMessage(targetChat, plainText, { reply_markup: replyMarkup }).catch(() => {});
+          });
       }
     } catch (botErr: any) {
       console.error("[NOTIFY] Failed to send Bot admin notification:", botErr.message);
@@ -2019,6 +2349,258 @@ async function startServer() {
   app.get("/api/health", (req, res) => res.json({ status: "ok" }));
   app.get("/health", (req, res) => res.json({ status: "ok" }));
 
+  // Push notification endpoints (Support both standard and legacy endpoints)
+  const serveVapidKey = async (req: express.Request, res: express.Response) => {
+    if (!vapidPublicKey || !vapidPrivateKey) {
+      await setupVapid();
+    }
+    console.log(`[Push] Serving VAPID public key: ${vapidPublicKey ? vapidPublicKey.substring(0, 10) + "..." : "NULL"}`);
+    res.json({ publicKey: vapidPublicKey });
+  };
+  app.get("/api/vapidPublicKey", serveVapidKey);
+  app.get("/api/vapid-public-key", serveVapidKey);
+  app.get("/api/push/vapid-public-key", serveVapidKey);
+  app.get("/api/push/vapidPublicKey", serveVapidKey);
+
+  const handlePushSubscription = async (req: express.Request, res: express.Response) => {
+    try {
+      const subscription = req.body;
+      if (!subscription || !subscription.endpoint) {
+        return res.status(400).json({ error: "Invalid subscription payload" });
+      }
+      const accountId = (getAccountId(req) || req.headers['x-account-id'] || 'default') as string;
+      const deviceId = (req.headers['x-device-id'] || req.body.deviceId || '') as string;
+      const deviceName = (req.headers['x-device-name'] || req.body.deviceName || '') as string;
+      const pushScope = (req.headers['x-push-scope'] || req.body.pushScope || 'current') as string;
+      const ip = getClientIp(req);
+      const ua = (req.headers['user-agent'] || '') as string;
+      const { platform } = parseDeviceInfo(ua, deviceName);
+
+      console.log(`[Push] Registering device subscription for ${subscription.endpoint.substring(0, 45)}... (account: ${accountId}, device: ${deviceId || 'browser'}, scope: ${pushScope}, ip: ${ip})`);
+      
+      await PushSubscription.findOneAndUpdate(
+        { endpoint: subscription.endpoint },
+        { 
+          endpoint: subscription.endpoint,
+          keys: subscription.keys,
+          account_id: accountId,
+          device_id: deviceId,
+          device_name: deviceName,
+          ip_address: ip,
+          push_scope: pushScope,
+          last_active: new Date()
+        },
+        { upsert: true, new: true }
+      );
+
+      if (deviceId) {
+        let accountName = "Main Profile";
+        if (accountId !== 'default') {
+          const p = await AccountProfile.findOne({ account_id: accountId });
+          if (p?.name) accountName = p.name;
+        } else {
+          const p = await AccountProfile.findOne({ is_main: true });
+          if (p?.name) accountName = p.name;
+        }
+
+        await DeviceSession.findOneAndUpdate(
+          { device_id: deviceId },
+          {
+            device_id: deviceId,
+            ip_address: ip,
+            user_agent: ua,
+            device_name: deviceName || `${platform} Device`,
+            platform: platform,
+            account_id: accountId,
+            account_name: accountName,
+            has_push: true,
+            endpoint: subscription.endpoint,
+            keys: subscription.keys,
+            last_active: new Date()
+          },
+          { upsert: true, new: true }
+        );
+      }
+
+      res.status(201).json({ status: "success", subscribed: true, account_id: accountId, ip_address: ip });
+    } catch (err: any) {
+      console.error("[Push] Error in subscribe handler:", err);
+      res.status(500).json({ error: err.message });
+    }
+  };
+  app.post("/api/subscribe", handlePushSubscription);
+  app.post("/api/push/subscribe", handlePushSubscription);
+
+  // Device heartbeat & tracking endpoints
+  const handleDevicePing = async (req: express.Request, res: express.Response) => {
+    try {
+      const deviceId = (req.headers['x-device-id'] || req.body?.deviceId || req.query?.deviceId || '') as string;
+      const accountId = (getAccountId(req) || req.headers['x-account-id'] || 'default') as string;
+      const tracked = await trackDeviceActivity(req, deviceId, accountId);
+      const ip = getClientIp(req);
+      res.json({ success: true, device: tracked, ip_address: ip, deviceId });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  };
+  app.post("/api/devices/ping", handleDevicePing);
+  app.post("/api/device/heartbeat", handleDevicePing);
+
+  // Get all registered / active devices with IP, login state and push readiness
+  app.get("/api/devices", async (req, res) => {
+    try {
+      const currentIp = getClientIp(req);
+      const currentDeviceId = (req.headers['x-device-id'] || req.query.deviceId || '') as string;
+      
+      const devices = await DeviceSession.find({}).sort({ last_active: -1 });
+      const subs = await PushSubscription.find({});
+      const subEndpointMap = new Set(subs.map(s => s.endpoint));
+      const subDeviceMap = new Set(subs.map(s => s.device_id).filter(Boolean));
+
+      const now = Date.now();
+      const mapped = devices.map(d => {
+        const diffSec = Math.round((now - new Date(d.last_active).getTime()) / 1000);
+        const isOnline = diffSec < 180; // Active within last 3 minutes
+        const hasActivePush = (d.endpoint && subEndpointMap.has(d.endpoint)) || (d.device_id && subDeviceMap.has(d.device_id));
+        return {
+          id: d.device_id,
+          deviceId: d.device_id,
+          ip: d.ip_address || "127.0.0.1",
+          deviceName: d.device_name || "Unknown Device",
+          platform: d.platform || "Mobile",
+          accountId: d.account_id || "default",
+          accountName: d.account_name || "Main Profile",
+          hasPush: Boolean(hasActivePush),
+          isCurrent: Boolean(d.device_id && d.device_id === currentDeviceId) || (Boolean(currentIp) && d.ip_address === currentIp),
+          isOnline,
+          lastActive: d.last_active,
+          createdAt: d.created_at
+        };
+      });
+
+      res.json({
+        devices: mapped,
+        currentIp,
+        currentDeviceId,
+        totalDevices: mapped.length,
+        onlineCount: mapped.filter(m => m.isOnline).length,
+        pushCount: mapped.filter(m => m.hasPush).length
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Remove / disconnect a device
+  app.delete("/api/devices/:id", async (req, res) => {
+    try {
+      const { id } = req.params;
+      await DeviceSession.deleteOne({ device_id: id });
+      await PushSubscription.deleteMany({ device_id: id });
+      res.json({ success: true, message: `Device ${id} removed` });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Blind push broadcast to all logged in / open devices or targeted device
+  const handlePushDispatch = async (req: express.Request, res: express.Response) => {
+    try {
+      const accountId = (getAccountId(req) || req.headers['x-account-id'] || 'default') as string;
+      const title = req.body?.title || "⚡ Blind Push Broadcast";
+      const body = req.body?.body || `Notification pushed to all active devices and sessions!`;
+      const targetDeviceId = req.body?.targetDeviceId;
+      const targetIp = req.body?.targetIp;
+
+      // 1. Fetch devices for the specific account to show transparency
+      const allDevices = await DeviceSession.find({ account_id: accountId }).sort({ last_active: -1 });
+      const targetDevices = allDevices.filter(d => {
+        if (targetDeviceId) return d.device_id === targetDeviceId;
+        if (targetIp) return d.ip_address === targetIp;
+        return true;
+      });
+
+      // 2. Dispatch Push
+      await sendPushNotification(title, body, { url: '/', tag: `push-${Date.now()}` }, accountId);
+
+      // 3. Emit SSE Event so all open web browsers receive in-app notification immediately
+      sendSseEvent('push_broadcast', {
+        title,
+        message: body,
+        targetDeviceId,
+        timestamp: new Date()
+      });
+
+      // 4. Save notification log so it appears immediately in the notifications list
+      const summaryList = targetDevices.map(d => `${d.device_name || 'Device'} (IP: ${d.ip_address || '127.0.0.1'})`).join(', ');
+      await saveLog(`Push Broadcast: "${title}" sent to ${targetDevices.length} device(s) [${summaryList || 'All Sessions'}]`, 'info', 'Push', '/api/push/test', { title, body, devices: summaryList }, accountId);
+
+      res.json({
+        success: true,
+        message: `Push successfully dispatched to ${targetDevices.length} device(s)!`,
+        deliveredCount: targetDevices.length,
+        devices: targetDevices.map(d => ({
+          deviceId: d.device_id,
+          deviceName: d.device_name,
+          ip: d.ip_address,
+          accountName: d.account_name
+        }))
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  };
+
+  app.post("/api/push/test", handlePushDispatch);
+  app.post("/api/push/blind-broadcast", handlePushDispatch);
+  app.post("/api/push/direct", handlePushDispatch);
+
+  app.get("/api/push/status", async (req, res) => {
+    try {
+      const accountId = (getAccountId(req) || req.headers['x-account-id'] || 'default') as string;
+      const count = await PushSubscription.countDocuments();
+      const accountCount = await PushSubscription.countDocuments({ account_id: accountId });
+      const deviceCount = await DeviceSession.countDocuments();
+      res.json({
+        totalDevices: count,
+        accountDevices: accountCount,
+        trackedDevices: deviceCount,
+        vapidConfigured: Boolean(vapidPublicKey && vapidPrivateKey)
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get("/api/push/ai-auto-mode", async (req, res) => {
+    try {
+      const accountId = (getAccountId(req) || req.headers['x-account-id'] || 'default') as string;
+      const setting = await getSetting("ai_push_auto_mode", accountId);
+      res.json({ enabled: setting?.value === "true" });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post("/api/push/ai-auto-mode", async (req, res) => {
+    try {
+      const accountId = (getAccountId(req) || req.headers['x-account-id'] || 'default') as string;
+      const { enabled } = req.body;
+      await setSetting("ai_push_auto_mode", enabled ? "true" : "false", accountId);
+      res.json({ success: true, enabled: Boolean(enabled) });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get("/api/heartbeat", (req, res) => {
+    res.json({
+      status: "online",
+      timestamp: Date.now(),
+      service: "24x7 Telegram Bot & Push Dispatcher"
+    });
+  });
+
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const groupId = process.env.TELEGRAM_GROUP_ID;
 
@@ -2040,62 +2622,10 @@ async function startServer() {
         await initBot(botToken);
       }
       
-      // Connect UserBot in background
-      (async () => {
-        if (isConnecting) return;
-        try {
-          isConnecting = true;
-          let sessionString = (await getSetting("session_string"))?.value;
-          
-          const apiIdRaw = (await getSetting("api_id"))?.value || "";
-          const apiHash = ((await getSetting("api_hash"))?.value || "").trim();
-          const apiId = parseInt(apiIdRaw.trim(), 10);
-
-          if (sessionString && !isNaN(apiId) && apiId > 0 && apiHash) {
-            console.log("Attempting to connect UserBot...");
-            userClient = new TelegramClient(new StringSession(sessionString), apiId, apiHash, {
-              connectionRetries: 5,
-              requestRetries: 5,
-              deviceModel: "Desktop",
-              systemVersion: "Windows 10",
-              appVersion: "1.0.0",
-            });
-            await userClient.connect();
-            
-            const newSessionString = (userClient.session as StringSession).save();
-            if (newSessionString && newSessionString !== sessionString) {
-              await setSetting("session_string", newSessionString);
-            }
-            
-            if (await userClient.isUserAuthorized()) {
-              console.log("UserBot connected successfully.");
-              sessionStartTime = Date.now();
-              setupUserBotHandlers(userClient, groupId);
-              cachedAuthStatus = true; accountClients.set("default", { accountId: "default", client: userClient, sessionStartTime: sessionStartTime }); await saveLog("UserBot connected automatically on startup", "info", "SYSTEM");
-            } else {
-              console.log("UserBot connected but session is invalid/expired.");
-              await userClient.disconnect();
-              userClient = null;
-            }
-          }
-        } catch (err: any) {
-          console.error("Failed to connect UserBot on startup:", err);
-          await saveLog(`Startup connection failed: ${err.message}`, "error", "SYSTEM");
-          if (err.message?.includes("AUTH_KEY_UNREGISTERED") || 
-              err.message?.includes("AUTH_KEY_DUPLICATED")) {
-            console.log(`Session invalid or duplicated (${err.message}) on startup. Clearing session string.`);
-            await deleteSetting("session_string");
-            if (userClient) {
-              try { await userClient.disconnect(); } catch (e) {}
-            }
-            userClient = null;
-          } else if (err.message?.includes("TIMEOUT")) {
-            console.log(`Connection timed out (${err.message}) on startup. Will retry later.`);
-          }
-        } finally {
-          isConnecting = false;
-        }
-      })();
+      // Background Engine: Verify and connect all authorized UserBots and active account
+      setTimeout(() => {
+        verifyAndConnectAllUserBots().catch(e => console.error("Initial verifyAndConnectAllUserBots failed:", e));
+      }, 1000);
     });
   };
 
@@ -2113,6 +2643,10 @@ async function startServer() {
         await mongoose.connection.collection("topics").dropIndex("telegram_topic_id_1").catch(() => {});
         await mongoose.connection.collection("replyhistories").dropIndex("topic_id_1_keyword_id_1").catch(() => {});
         await mongoose.connection.collection("photoreplyhistories").dropIndex("topic_id_1").catch(() => {});
+        await mongoose.connection.collection("settings").dropIndex("key_1").catch(() => {});
+        await mongoose.connection.collection("settings").dropIndex("key_1_profile_1").catch(() => {});
+        await mongoose.connection.collection("settings").updateMany({ account_id: { $exists: false } }, { $set: { account_id: "default" } }).catch(() => {});
+        await mongoose.connection.collection("settings").updateMany({ account_id: null }, { $set: { account_id: "default" } }).catch(() => {});
         console.log("Old indexes checked and dropped if existed.");
       } catch (idxErr) {
         console.error("Index cleanup error:", idxErr);
@@ -2129,6 +2663,11 @@ async function startServer() {
     });
 
   function setupUserBotHandlers(client: TelegramClient, targetGroupId: string, accountId: string = "default") {
+    if ((client as any)._botflowHandlerAttached) {
+      return;
+    }
+    (client as any)._botflowHandlerAttached = true;
+
     client.addEventHandler(async (event: any) => {
       try {
         const message = event.message;
@@ -2157,18 +2696,6 @@ async function startServer() {
       const normalizedChatId = chatId.toString().trim().replace(/^-100|^ -100|^-/, "");
       
       if (allowedGroupIds.length === 0 || !allowedGroupIds.includes(normalizedChatId)) {
-        if (!message.out) {
-          console.log(`UserBot (${accountId}) ignoring message from unregistered chat ${chatId} (Normalized: ${normalizedChatId}). Allowed registered groups:`, allowedGroupIds);
-          // Save a log once to notify the user that this group is unregistered
-          if (message.message) {
-             const cacheKey = `ignored_${normalizedChatId}`;
-             if (!settingsCache[accountId]) settingsCache[accountId] = {};
-             if (!settingsCache[accountId][cacheKey]) {
-                saveLog(`Message ignored from unregistered chat: ${chatId}. Bot replies are strictly restricted to registered Target Group IDs in Settings.`, "warn", "USERBOT", undefined, undefined, accountId);
-                settingsCache[accountId][cacheKey] = "true";
-             }
-          }
-        }
         return;
       }
 
@@ -2273,7 +2800,7 @@ async function startServer() {
           sendPushNotification("Topic Auto-Blocked 🛑", `Topic "${name}" was auto-blocked by keyword "${matchedKeyword}"`, {
             url: link || '/',
             tag: `block-${topicId}`
-          }).catch(e => console.error("WebPush block error:", e));
+          }, accountId).catch(e => console.error("WebPush block error:", e));
 
           if (bot) {
             getBotAdminChatIds().then(adminChats => {
@@ -2336,7 +2863,7 @@ async function startServer() {
           
           console.log(`[PHOTO] Photo detected in group: ${chatTitle}, topic: ${topicName} (${topicId}), link: ${link}`);
           
-          // Send all multi-channel notifications (Push, SSE, Telegram Saved Messages "me", Bot Admin alert)
+          // Send multi-channel notifications (Web Push notification, UI SSE event, Bot Admin alert)
           sendPhotoReceivedNotification({
             chatTitle,
             topicName,
@@ -2529,18 +3056,23 @@ async function startServer() {
             if (!wordLower) continue;
 
             const escapedWord = escapeRegExp(wordLower);
-            let regex: RegExp;
-            
-            if (kw.match_mode === 'partial') {
-              regex = new RegExp(escapedWord, 'gi');
+            if (kw.match_mode === 'exact') {
+              if (text === wordLower) {
+                matches.push({ kw, index: 0, matchedWord: wordLower });
+              } else {
+                // Word boundary check for exact mode
+                const regex = new RegExp(`\\b${escapedWord}\\b`, 'gi');
+                const match = regex.exec(text);
+                if (match) {
+                  matches.push({ kw, index: match.index, matchedWord: wordLower });
+                }
+              }
             } else {
-              regex = new RegExp(`(^|[^\\p{L}\\p{N}])${escapedWord}($|[^\\p{L}\\p{N}])`, 'gui');
-            }
-            
-            let match;
-            while ((match = regex.exec(text)) !== null) {
-              matches.push({ kw, index: match.index, matchedWord: wordLower });
-              break;
+              // Partial mode using super-fast indexOf
+              const idx = text.indexOf(wordLower);
+              if (idx !== -1) {
+                matches.push({ kw, index: idx, matchedWord: wordLower });
+              }
             }
           }
         }
@@ -2552,8 +3084,12 @@ async function startServer() {
           const keywordDelaySeconds = parseInt((await getSetting("keyword_delay_seconds", accountId))?.value || "0", 10);
           
           const matchedWordsList = matches.map(m => m.matchedWord).join(", ");
-          const topicName = topicNamesCache[topicId] || "General";
-          const chatTitle = topicNamesCache[chatId] || "Telegram Group";
+          let topicName = topicNamesCache[topicId] || (topicId ? `Topic #${topicId}` : "General");
+          let chatTitle = "Telegram Group";
+          try {
+            const chat = await client.getEntity(message.peerId) as any;
+            if (chat && chat.title) chatTitle = chat.title;
+          } catch (e) {}
 
           // Log in background non-blocking
           saveLog(`Keyword(s) detected: "${matchedWordsList}" in ${chatTitle} > ${topicName}`, 'info', 'USERBOT', undefined, { 
@@ -2627,7 +3163,7 @@ async function startServer() {
                 sendPushNotification("Approval Required ⚠️", `Keyword "${match.matchedWord}" in "${topicName}" (${chatTitle})`, {
                   url: topicLink || '/',
                   tag: `approval-${approval._id}`
-                }).catch(e => console.error("WebPush approval error:", e));
+                }, accountId).catch(e => console.error("WebPush approval error:", e));
                 
                 if (bot) {
                   const notificationText = `🔔 <b>Approval Required</b>\n\n` +
@@ -2963,6 +3499,12 @@ async function startServer() {
       }
       } catch (globalErr: any) {
         console.error("Global error in UserBot event handler:", globalErr);
+        
+        // Log the exact error to the database so the user can diagnose issues from the dashboard
+        const stackTrace = globalErr.stack || String(globalErr);
+        const errMessage = globalErr.message || "Unknown processing error";
+        await saveLog(`Bot Processing Error: ${errMessage}. details: ${stackTrace.slice(0, 400)}`, 'error', 'USERBOT', undefined, { error: stackTrace }, accountId).catch(() => {});
+
         if (globalErr.message?.includes("AUTH_KEY_UNREGISTERED")) {
           console.log("Session invalid in event handler. Clearing session string.");
           await deleteSetting("session_string");
@@ -2974,7 +3516,7 @@ async function startServer() {
           console.log("Connection timed out in event handler. Will retry later.");
         }
       }
-    });
+    }, new NewMessage({}));
   }
 
   //sseClients.length;
@@ -2996,7 +3538,8 @@ async function startServer() {
     } catch (e) {}
 
     const clientId = Date.now();
-    const newClient = { id: clientId, res };
+    const accountId = (req.query.account_id as string) || "default";
+    const newClient = { id: clientId, res, accountId };
     sseClients.push(newClient);
 
     req.on("close", () => {
@@ -3011,6 +3554,244 @@ async function startServer() {
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Account Profile Routes (Persisted in MongoDB)
+  app.get("/api/accounts", async (req, res) => {
+    try {
+      let accounts = await AccountProfile.find().sort({ created_at: 1 }).lean();
+      
+      // Ensure default account profile exists
+      let hasDefault = accounts.some(a => a.account_id === 'default');
+      if (!hasDefault) {
+        const defaultAcc = await AccountProfile.findOneAndUpdate(
+          { account_id: 'default' },
+          {
+            account_id: 'default',
+            name: 'Main Account',
+            avatar_color: 'from-blue-600 to-indigo-600',
+            is_main: true,
+            created_at: new Date()
+          },
+          { upsert: true, new: true }
+        ).lean();
+        accounts = [defaultAcc as any, ...accounts];
+      }
+
+      const activeDoc = await getSetting("active_account_id");
+      const activeAccountId = activeDoc?.value || 'default';
+
+      // Enrich with live session data
+      const enriched = accounts.map(acc => {
+        const session = accountClients.get(acc.account_id);
+        const isClientActive = !!(session?.client || (acc.account_id === 'default' && userClient && cachedAuthStatus));
+        const liveUser = session?.loginUser;
+        return {
+          id: acc.account_id,
+          name: acc.name,
+          avatarColor: acc.avatar_color,
+          isMain: !!acc.is_main,
+          lockPin: acc.lock_pin || '',
+          phone: acc.phone || liveUser?.phone || '',
+          telegramName: acc.telegram_name || (liveUser ? [liveUser.firstName, liveUser.lastName].filter(Boolean).join(' ') : ''),
+          telegramUsername: acc.telegram_username || liveUser?.username || '',
+          isConnected: isClientActive,
+          createdAt: acc.created_at,
+          updatedAt: acc.updated_at,
+          isActive: acc.account_id === activeAccountId
+        };
+      });
+
+      res.json({ accounts: enriched, activeAccountId });
+    } catch (err: any) {
+      console.error("[GET /api/accounts] Error:", err);
+      res.status(500).json({ error: `[GET /api/accounts] ${err.message}` });
+    }
+  });
+
+  // Active Account State Management & Login Verification APIs
+  app.get("/api/accounts/active", async (req, res) => {
+    try {
+      const activeDoc = await getSetting("active_account_id");
+      const activeAccountId = activeDoc?.value || 'default';
+      const session = accountClients.get(activeAccountId);
+      const isClientActive = !!(session?.client && session.client.connected && (session ? true : cachedAuthStatus));
+      
+      res.json({
+        success: true,
+        activeAccountId,
+        isConnected: isClientActive,
+        user: session?.loginUser || null
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post("/api/accounts/active", async (req, res) => {
+    try {
+      const { accountId } = req.body;
+      const targetId = String(accountId || 'default').trim();
+      
+      await setSetting("active_account_id", targetId);
+      console.log(`[Account] Active account switched to "${targetId}" on server.`);
+      
+      // Trigger instant background verification & connection for this active account
+      verifyAndConnectAccount(targetId).catch(err => console.error("Error verifying active account:", err));
+      
+      const session = accountClients.get(targetId);
+      res.json({
+        success: true,
+        activeAccountId: targetId,
+        isConnected: !!(session?.client && session.client.connected),
+        user: session?.loginUser || null
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post("/api/accounts/verify-login", async (req, res) => {
+    try {
+      const accountId = getAccountId(req);
+      console.log(`[Account] Explicit login verification requested for account "${accountId}"`);
+      const connected = await verifyAndConnectAccount(accountId, true);
+      const session = accountClients.get(accountId);
+      res.json({
+        success: true,
+        accountId,
+        isConnected: connected,
+        user: session?.loginUser || null
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post("/api/accounts", async (req, res) => {
+    try {
+      const { id, name, avatarColor, isMain } = req.body;
+      const finalName = String(name || '').trim();
+      if (!finalName) {
+        return res.status(400).json({ error: "Account name is required" });
+      }
+
+      const accountId = (id && String(id).trim()) || `acc_${Date.now()}`;
+      const isMainAcc = accountId === 'default' || !!isMain;
+
+      const doc = await AccountProfile.findOneAndUpdate(
+        { account_id: accountId },
+        {
+          account_id: accountId,
+          name: finalName,
+          avatar_color: avatarColor || 'from-blue-600 to-indigo-600',
+          is_main: isMainAcc,
+          updated_at: new Date()
+        },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+
+      await saveLog(`Account profile created/updated: "${finalName}" (${accountId})`, 'info', 'API', '/api/accounts', undefined, accountId);
+      res.json({
+        success: true,
+        account: {
+          id: doc.account_id,
+          name: doc.name,
+          avatarColor: doc.avatar_color,
+          isMain: doc.is_main
+        }
+      });
+    } catch (err: any) {
+      console.error("[POST /api/accounts] Error:", err);
+      res.status(500).json({ error: `[POST /api/accounts] ${err.message}` });
+    }
+  });
+
+  app.put("/api/accounts/:id", async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { name, avatarColor, lockPin } = req.body;
+      const finalName = String(name || '').trim();
+      if (!finalName) {
+        return res.status(400).json({ error: "Account name is required" });
+      }
+
+      const updateData: any = {
+        name: finalName,
+        updated_at: new Date()
+      };
+      if (avatarColor) {
+        updateData.avatar_color = avatarColor;
+      }
+      if (lockPin !== undefined) {
+        updateData.lock_pin = String(lockPin).trim();
+      }
+
+      const doc = await AccountProfile.findOneAndUpdate(
+        { account_id: id },
+        updateData,
+        { new: true, upsert: true }
+      );
+
+      await saveLog(`Account renamed or lock status updated: "${finalName}" (${id})`, 'info', 'API', `/api/accounts/${id}`, undefined, id);
+      res.json({
+        success: true,
+        account: {
+          id: doc.account_id,
+          name: doc.name,
+          avatarColor: doc.avatar_color,
+          isMain: doc.is_main,
+          lockPin: doc.lock_pin || ''
+        }
+      });
+    } catch (err: any) {
+      console.error("[PUT /api/accounts/:id] Error:", err);
+      res.status(500).json({ error: `[PUT /api/accounts/:id] ${err.message}` });
+    }
+  });
+
+  app.delete("/api/accounts/:id", async (req, res) => {
+    try {
+      const { id } = req.params;
+      if (id === 'default') {
+        return res.status(400).json({ error: "Main Account is permanent and cannot be deleted" });
+      }
+
+      // 1. Delete profile doc from MongoDB
+      await AccountProfile.deleteOne({ account_id: id });
+
+      // 2. Disconnect & cleanup live telegram client if active
+      const session = accountClients.get(id);
+      if (session?.client) {
+        try {
+          await session.client.disconnect();
+        } catch (e) {
+          console.warn(`Error disconnecting client for deleted account ${id}:`, e);
+        }
+      }
+      accountClients.delete(id);
+      accountAuthStates.delete(id);
+
+      // 3. Purge all isolated account data
+      await Setting.deleteMany({ account_id: id });
+      await Keyword.deleteMany({ account_id: id });
+      await Log.deleteMany({ account_id: id });
+      await BlockedTopic.deleteMany({ account_id: id });
+      await PhotoReplyHistory.deleteMany({ account_id: id });
+      await ReplyHistory.deleteMany({ account_id: id });
+      await PhotoSentLog.deleteMany({ account_id: id });
+      await MissedTrigger.deleteMany({ account_id: id });
+      await SessionHistory.deleteMany({ account_id: id });
+      await ImportBatch.deleteMany({ account_id: id });
+      await PushSubscription.deleteMany({ account_id: id });
+      blockedTopicsCache.delete(id);
+
+      await saveLog(`Account and all its data permanently deleted: ${id}`, 'info', 'API', `/api/accounts/${id}`, undefined, 'default');
+      res.json({ success: true, message: `Account ${id} deleted successfully` });
+    } catch (err: any) {
+      console.error("[DELETE /api/accounts/:id] Error:", err);
+      res.status(500).json({ error: `[DELETE /api/accounts/:id] ${err.message}` });
     }
   });
 
@@ -3031,41 +3812,254 @@ async function startServer() {
     }
   });
 
+  app.get("/api/data/last-import-info", async (req, res) => {
+    try {
+      const accountId = getAccountId(req);
+      const lastBatch = await ImportBatch.findOne(getAccountFilter(accountId)).sort({ imported_at: -1, _id: -1 });
+      const totalKeywords = await Keyword.countDocuments(getAccountFilter(accountId));
+      const latestKw = await Keyword.findOne(getAccountFilter(accountId)).sort({ _id: -1 });
+      const latestRuleName = latestKw ? (latestKw.keyword || (latestKw.keywords && latestKw.keywords[0]) || 'Rule') : '';
+
+      if (lastBatch) {
+        const existingCount = await Keyword.countDocuments({
+          $or: [
+            { _id: { $in: lastBatch.keyword_ids } },
+            { last_import_batch_id: lastBatch.batch_id }
+          ],
+          ...getAccountFilter(accountId)
+        });
+        return res.json({
+          hasLastImport: true,
+          batchId: lastBatch.batch_id,
+          importedAt: lastBatch.imported_at,
+          count: existingCount > 0 ? existingCount : lastBatch.count,
+          names: lastBatch.keyword_names ? lastBatch.keyword_names.slice(0, 10) : [],
+          latestRuleName,
+          totalRules: totalKeywords
+        });
+      }
+
+      // Check if any keywords exist with a batch id in database
+      const kwWithBatch = await Keyword.findOne({
+        last_import_batch_id: { $exists: true, $ne: null },
+        ...getAccountFilter(accountId)
+      }).sort({ _id: -1 });
+
+      if (kwWithBatch && kwWithBatch.last_import_batch_id) {
+        const count = await Keyword.countDocuments({
+          last_import_batch_id: kwWithBatch.last_import_batch_id,
+          ...getAccountFilter(accountId)
+        });
+        return res.json({
+          hasLastImport: true,
+          batchId: kwWithBatch.last_import_batch_id,
+          importedAt: (kwWithBatch as any).created_at || null,
+          count: count,
+          names: [],
+          latestRuleName,
+          totalRules: totalKeywords
+        });
+      }
+
+      // Smart Fallback for files imported before batch tracking update
+      if (latestKw) {
+        const allKws = await Keyword.find(getAccountFilter(accountId)).sort({ _id: -1 }).lean();
+        const latestTime = latestKw._id.getTimestamp().getTime();
+        // Group keywords created within 10 minutes (600,000ms) of the latest keyword
+        const cluster = allKws.filter(k => Math.abs((k._id as any).getTimestamp().getTime() - latestTime) <= 600000);
+        const clusterCount = cluster.length > 0 ? cluster.length : 1;
+
+        return res.json({
+          hasLastImport: true,
+          batchId: 'legacy_cluster',
+          importedAt: latestKw._id.getTimestamp(),
+          count: clusterCount,
+          names: cluster.slice(0, 10).map(k => k.keyword || (k.keywords && k.keywords[0]) || 'Rule'),
+          latestRuleName,
+          totalRules: totalKeywords,
+          isLegacy: true
+        });
+      }
+
+      res.json({
+        hasLastImport: false,
+        batchId: null,
+        importedAt: null,
+        count: 0,
+        names: [],
+        latestRuleName: '',
+        totalRules: 0
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Delete ENTIRE Last Imported File (All Rules in Batch)
   app.delete("/api/data/last-import", async (req, res) => {
     try {
       const accountId = getAccountId(req);
-      const lastKeyword = await Keyword.findOne(getAccountFilter(accountId)).sort({ _id: -1 });
-      if (lastKeyword) {
-        await Keyword.deleteOne({ _id: lastKeyword._id });
-        res.json({ success: true });
+      const lastBatch = await ImportBatch.findOne(getAccountFilter(accountId)).sort({ imported_at: -1, _id: -1 });
+
+      let deletedCount = 0;
+      if (lastBatch) {
+        const result = await Keyword.deleteMany({
+          $or: [
+            { _id: { $in: lastBatch.keyword_ids } },
+            { last_import_batch_id: lastBatch.batch_id }
+          ],
+          ...getAccountFilter(accountId)
+        });
+        deletedCount = result.deletedCount || 0;
+        await ImportBatch.deleteOne({ _id: lastBatch._id });
       } else {
-        res.status(404).json({ error: "No keywords found" });
+        // Fallback 1: check keywords by last_import_batch_id
+        const lastKwWithBatch = await Keyword.findOne({
+          last_import_batch_id: { $exists: true, $ne: null },
+          ...getAccountFilter(accountId)
+        }).sort({ _id: -1 });
+
+        if (lastKwWithBatch && lastKwWithBatch.last_import_batch_id) {
+          const result = await Keyword.deleteMany({
+            last_import_batch_id: lastKwWithBatch.last_import_batch_id,
+            ...getAccountFilter(accountId)
+          });
+          deletedCount = result.deletedCount || 0;
+        } else {
+          // Fallback 2 (Legacy): Find recent cluster of keywords imported together
+          const allKws = await Keyword.find(getAccountFilter(accountId)).sort({ _id: -1 });
+          if (allKws.length > 0) {
+            const latestTime = allKws[0]._id.getTimestamp().getTime();
+            const cluster = allKws.filter(k => Math.abs(k._id.getTimestamp().getTime() - latestTime) <= 600000);
+            const clusterIds = cluster.map(k => k._id);
+            const result = await Keyword.deleteMany({
+              _id: { $in: clusterIds },
+              ...getAccountFilter(accountId)
+            });
+            deletedCount = result.deletedCount || cluster.length;
+          } else {
+            return res.status(404).json({ error: "No rules found in database to delete" });
+          }
+        }
       }
+
+      await refreshKeywordCache();
+      await saveLog(`Deleted all ${deletedCount} rules from last imported JSON file`, 'info', 'API', '/api/data/last-import', undefined, accountId);
+      res.json({ 
+        success: true, 
+        deletedCount, 
+        message: `Successfully deleted all ${deletedCount} rule(s) from the last imported JSON file!` 
+      });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
   });
 
-  app.get("/api/push/vapid-public-key", (req, res) => {
-    console.log(`Serving VAPID public key: ${vapidPublicKey ? vapidPublicKey.substring(0, 10) + "..." : "NULL"}`);
-    res.json({ publicKey: vapidPublicKey });
-  });
-
-  app.post("/api/push/subscribe", async (req, res) => {
+  // Delete Single Last 1 Rule (1 by 1)
+  app.delete("/api/data/last-rule", async (req, res) => {
     try {
-      const subscription = req.body;
-      console.log(`Received push subscription request for endpoint: ${subscription.endpoint}`);
-      await PushSubscription.findOneAndUpdate(
-        { endpoint: subscription.endpoint },
-        subscription,
-        { upsert: true }
-      );
-      res.status(201).json({ status: "success" });
+      const accountId = getAccountId(req);
+      const lastKeyword = await Keyword.findOne(getAccountFilter(accountId)).sort({ _id: -1 });
+      
+      if (!lastKeyword) {
+        return res.status(404).json({ error: "No rules found in database to delete" });
+      }
+
+      const ruleName = lastKeyword.keyword || (lastKeyword.keywords && lastKeyword.keywords[0]) || 'Rule';
+      await Keyword.deleteOne({ _id: lastKeyword._id });
+
+      // If this keyword was in an ImportBatch, remove its id and decrement count
+      if (lastKeyword.last_import_batch_id) {
+        await ImportBatch.updateOne(
+          { batch_id: lastKeyword.last_import_batch_id, ...getAccountFilter(accountId) },
+          { $pull: { keyword_ids: lastKeyword._id }, $inc: { count: -1 } }
+        );
+      }
+
+      await refreshKeywordCache();
+      await saveLog(`Deleted last single rule: "${ruleName}"`, 'info', 'API', '/api/data/last-rule', undefined, accountId);
+      res.json({
+        success: true,
+        deletedRule: ruleName,
+        message: `Successfully deleted last rule "${ruleName}"!`
+      });
     } catch (err: any) {
-      console.error("Error in /api/push/subscribe:", err);
       res.status(500).json({ error: err.message });
     }
   });
+
+  // Get ALL Past Imported Batches/Files History
+  app.get("/api/data/import-batches", async (req, res) => {
+    try {
+      const accountId = getAccountId(req);
+      const batches = await ImportBatch.find(getAccountFilter(accountId)).sort({ imported_at: -1 }).lean();
+      
+      const batchesWithCount = await Promise.all(batches.map(async (b: any) => {
+        const activeCount = await Keyword.countDocuments({
+          $or: [
+            { _id: { $in: b.keyword_ids || [] } },
+            { last_import_batch_id: b.batch_id }
+          ],
+          ...getAccountFilter(accountId)
+        });
+        return {
+          id: b._id,
+          batchId: b.batch_id,
+          fileName: b.file_name || `Import_${new Date(b.imported_at).toLocaleDateString()}`,
+          importedAt: b.imported_at,
+          count: activeCount > 0 ? activeCount : b.count,
+          names: b.keyword_names ? b.keyword_names.slice(0, 10) : []
+        };
+      }));
+
+      res.json({ batches: batchesWithCount.filter(b => b.count > 0) });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Delete a specific imported file batch by batchId
+  app.delete("/api/data/import-batch/:batchId", async (req, res) => {
+    try {
+      const accountId = getAccountId(req);
+      const { batchId } = req.params;
+
+      const batchDoc = await ImportBatch.findOne({ batch_id: batchId, ...getAccountFilter(accountId) });
+
+      let deletedCount = 0;
+      if (batchDoc && batchDoc.keyword_ids && batchDoc.keyword_ids.length > 0) {
+        const result = await Keyword.deleteMany({
+          $or: [
+            { _id: { $in: batchDoc.keyword_ids } },
+            { last_import_batch_id: batchId }
+          ],
+          ...getAccountFilter(accountId)
+        });
+        deletedCount = result.deletedCount || 0;
+      } else {
+        const result = await Keyword.deleteMany({
+          last_import_batch_id: batchId,
+          ...getAccountFilter(accountId)
+        });
+        deletedCount = result.deletedCount || 0;
+      }
+
+      await ImportBatch.deleteOne({ batch_id: batchId, ...getAccountFilter(accountId) });
+      await refreshKeywordCache();
+      const fileNameStr = batchDoc?.file_name || batchId;
+      await saveLog(`Deleted import batch "${fileNameStr}" (${deletedCount} rules)`, 'info', 'API', `/api/data/import-batch/${batchId}`, undefined, accountId);
+
+      res.json({
+        success: true,
+        deletedCount,
+        message: `Successfully deleted imported file "${fileNameStr}" (${deletedCount} rules removed)!`
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+
 
   app.post("/api/push/unsubscribe", async (req, res) => {
     try {
@@ -3080,7 +4074,8 @@ async function startServer() {
 
   app.post("/api/push/test", async (req, res) => {
     try {
-      await sendPushNotification("Test Notification", "This is a test notification from your bot!");
+      const accountId = getAccountId(req);
+      await sendPushNotification("Test Notification", "This is a test notification from your bot!", {}, accountId);
       res.json({ status: "success" });
     } catch (err: any) {
       console.error("Error in /api/push/test:", err);
@@ -3106,80 +4101,197 @@ async function startServer() {
   });
 
 
-  async function checkAndReconnectUserBot() {
-    if (isConnecting) return;
-    
+  let isBackgroundVerifying = false;
+
+  async function verifyAndConnectAccount(accId: string, forceReconnect: boolean = false): Promise<boolean> {
     try {
-      const sessionDocs = await Setting.find({ key: "session_string" });
-      for (const doc of sessionDocs) {
-        const accId = doc.account_id || 'default';
-        const sessionString = doc.value;
-        if (!sessionString) continue;
+      const sessionDoc = await Setting.findOne({ key: "session_string", ...getAccountFilter(accId) });
+      const sessionString = sessionDoc?.value;
+      if (!sessionString) {
+        return false;
+      }
 
-        const currentSession = accountClients.get(accId);
-        let client = currentSession?.client || (accId === 'default' ? userClient : null);
-        let isConnectedAndAuthed = false;
+      // Determine credentials with full fallback: account-specific -> default -> environment defaults
+      const apiIdRaw = (await getSetting("api_id", accId))?.value || (await getSetting("api_id", "default"))?.value || process.env.TELEGRAM_API_ID || "34669075";
+      const apiHash = ((await getSetting("api_hash", accId))?.value || (await getSetting("api_hash", "default"))?.value || process.env.TELEGRAM_API_HASH || "b0f0ffda80d58bea235b2d232fbcbc79").trim();
+      const apiId = parseInt(apiIdRaw.trim(), 10);
+      if (isNaN(apiId) || apiId <= 0 || !apiHash) {
+        console.warn(`[UserBot Background] Account "${accId}" has invalid API credentials: ID=${apiIdRaw}, Hash=${apiHash ? 'OK' : 'MISSING'}`);
+        return false;
+      }
 
-        if (client && client.connected) {
-          try {
-            isConnectedAndAuthed = await client.isUserAuthorized();
-          } catch (e) {
-            isConnectedAndAuthed = false;
-          }
-        }
+      const currentSession = accountClients.get(accId);
+      let client = currentSession?.client || (accId === 'default' ? userClient : null);
 
-        if (!isConnectedAndAuthed) {
-          const apiIdRaw = (await getSetting("api_id", accId))?.value || "";
-          const apiHash = ((await getSetting("api_hash", accId))?.value || "").trim();
-          const apiId = parseInt(apiIdRaw.trim(), 10);
-
-          if (!isNaN(apiId) && apiId > 0 && apiHash) {
-            try {
-              console.log(`Auto-reconnecting UserBot for account ${accId}...`);
-              if (client) {
-                try { await client.disconnect(); } catch (e) {}
-              }
-              const newClient = new TelegramClient(new StringSession(sessionString), apiId, apiHash, {
-                connectionRetries: 5,
-                requestRetries: 5,
-                deviceModel: "Desktop",
-                systemVersion: "Windows 10",
-                appVersion: "1.0.0",
-              });
-              await newClient.connect();
-              
-              if (await newClient.isUserAuthorized()) {
-                const currentGroupId = getCachedSetting("telegram_group_ids", accId) || (accId === 'default' ? process.env.TELEGRAM_GROUP_ID : "") || "";
-                setupUserBotHandlers(newClient, currentGroupId, accId);
-                accountClients.set(accId, { accountId: accId, client: newClient, sessionStartTime: Date.now() });
-                if (accId === 'default') {
-                  userClient = newClient;
-                  cachedAuthStatus = true;
-                  lastAuthCheck = Date.now();
-                  sessionStartTime = Date.now();
+      if (client && client.connected && !forceReconnect) {
+        try {
+          const isAuthed = await client.isUserAuthorized();
+          if (isAuthed) {
+            if (!currentSession?.loginUser) {
+              try {
+                const me = await client.getMe();
+                if (me) {
+                  const liveUser = {
+                    id: me.id.toString(),
+                    firstName: me.firstName,
+                    lastName: me.lastName,
+                    username: me.username,
+                    phone: me.phone
+                  };
+                  if (currentSession) currentSession.loginUser = liveUser;
+                  const tgName = [me.firstName, me.lastName].filter(Boolean).join(' ');
+                  await AccountProfile.findOneAndUpdate(
+                    { account_id: accId },
+                    {
+                      telegram_name: tgName || me.username || '',
+                      telegram_username: me.username || '',
+                      phone: me.phone || '',
+                      updated_at: new Date()
+                    }
+                  );
                 }
-                console.log(`UserBot for account ${accId} connected and authorized.`);
-                await saveLog(`UserBot auto-connected successfully`, "info", "SYSTEM", undefined, undefined, accId);
-              } else {
-                console.log(`UserBot session for account ${accId} unauthorized.`);
-                await newClient.disconnect();
-                if (accId === 'default') userClient = null;
-                if (accountClients.has(accId)) { await recordSessionEnd(accId, accountClients.get(accId)?.sessionStartTime); }
-                accountClients.delete(accId);
-              }
-            } catch (connErr: any) {
-              console.error(`Auto-reconnect failed for account ${accId}:`, connErr.message);
+              } catch (e) {}
             }
+            return true;
           }
+        } catch (e) {
+          // Stale connection, proceed to reconnect
         }
       }
+
+      console.log(`[UserBot Background] Verifying and connecting account "${accId}"...`);
+      if (client) {
+        try { await client.disconnect(); } catch (e) {}
+      }
+
+      const newClient = new TelegramClient(new StringSession(sessionString), apiId, apiHash, {
+        connectionRetries: 5,
+        requestRetries: 5,
+        deviceModel: "Desktop",
+        systemVersion: "Windows 10",
+        appVersion: "1.0.0",
+      });
+
+      await newClient.connect();
+
+      // Persist new session string if updated by Telegram
+      try {
+        const newSessionString = (newClient.session as StringSession).save();
+        if (newSessionString && newSessionString !== sessionString) {
+          await setSetting("session_string", newSessionString, accId);
+        }
+      } catch (e) {}
+
+      const isAuthorized = await newClient.isUserAuthorized();
+      if (isAuthorized) {
+        let liveUser: any = null;
+        try {
+          const me = await newClient.getMe();
+          if (me) {
+            liveUser = {
+              id: me.id.toString(),
+              firstName: me.firstName,
+              lastName: me.lastName,
+              username: me.username,
+              phone: me.phone
+            };
+            const tgName = [me.firstName, me.lastName].filter(Boolean).join(' ');
+            await AccountProfile.findOneAndUpdate(
+              { account_id: accId },
+              {
+                telegram_name: tgName || me.username || '',
+                telegram_username: me.username || '',
+                phone: me.phone || '',
+                updated_at: new Date()
+              }
+            );
+          }
+        } catch (e) {
+          console.warn(`[UserBot Background] Could not fetch getMe for account "${accId}":`, e);
+        }
+
+        const targetGroupId = getCachedSetting("telegram_group_ids", accId) || getCachedSetting("telegram_group_ids", "default") || process.env.TELEGRAM_GROUP_ID || "";
+        setupUserBotHandlers(newClient, targetGroupId, accId);
+
+        const startTime = Date.now();
+        accountClients.set(accId, {
+          accountId: accId,
+          client: newClient,
+          sessionStartTime: startTime,
+          phoneNumber: liveUser?.phone,
+          loginUser: liveUser
+        });
+
+        const activeAccountId = (await getSetting("active_account_id"))?.value || 'default';
+        if (accId === activeAccountId || accId === 'default') {
+          userClient = newClient;
+          cachedAuthStatus = true;
+          lastAuthCheck = Date.now();
+          sessionStartTime = startTime;
+        }
+
+        console.log(`[UserBot Background] Account "${accId}" (${liveUser?.phone || liveUser?.username || 'user'}) verified & connected successfully in background!`);
+        await saveLog(`Background Login Verified: UserBot connected for account "${accId}" (${liveUser?.phone || liveUser?.username || 'user'})`, "info", "SYSTEM", undefined, undefined, accId);
+        return true;
+      } else {
+        console.warn(`[UserBot Background] Session for account "${accId}" is unauthorized or expired.`);
+        try { await newClient.disconnect(); } catch (e) {}
+        if (accId === 'default') {
+          userClient = null;
+          cachedAuthStatus = false;
+        }
+        if (accountClients.has(accId)) {
+          await recordSessionEnd(accId, accountClients.get(accId)?.sessionStartTime);
+          accountClients.delete(accId);
+        }
+        return false;
+      }
     } catch (err: any) {
-      console.error("Error in background checkAndReconnectUserBot:", err);
+      console.error(`[UserBot Background] Error verifying/connecting account "${accId}":`, err.message);
+      return false;
     }
   }
 
-  // Start background connection check every 1 minute
-  setInterval(checkAndReconnectUserBot, 60000);
+  async function verifyAndConnectAllUserBots() {
+    if (isBackgroundVerifying) return;
+    isBackgroundVerifying = true;
+    try {
+      await refreshSettingsCache();
+      const activeDoc = await getSetting("active_account_id");
+      const activeAccountId = activeDoc?.value || 'default';
+
+      const sessionDocs = await Setting.find({ key: "session_string" });
+      const accountIds = new Set<string>();
+      
+      accountIds.add(activeAccountId);
+      accountIds.add('default');
+      
+      for (const doc of sessionDocs) {
+        if (doc.value && doc.value.trim()) {
+          accountIds.add(doc.account_id || 'default');
+        }
+      }
+
+      for (const accId of accountIds) {
+        try {
+          await verifyAndConnectAccount(accId);
+        } catch (accErr: any) {
+          console.error(`[UserBot Background] Failed verifying account "${accId}":`, accErr.message);
+        }
+      }
+    } catch (err: any) {
+      console.error("[UserBot Background] Error in verifyAndConnectAllUserBots:", err);
+    } finally {
+      isBackgroundVerifying = false;
+    }
+  }
+
+  async function checkAndReconnectUserBot() {
+    await verifyAndConnectAllUserBots();
+  }
+
+  // Continuously verify and maintain background UserBot sessions every 30 seconds
+  setInterval(checkAndReconnectUserBot, 30000);
 
   // Serve dynamic active App Icon (supports Base64, preset URLs, and static fallbacks)
   app.get("/api/app-icon.png", async (req, res) => {
@@ -3309,6 +4421,22 @@ async function startServer() {
             if (session) {
               session.loginUser = loginUser;
             }
+
+            // Sync telegram user details to AccountProfile in MongoDB
+            try {
+              const tgName = [me.firstName, me.lastName].filter(Boolean).join(' ');
+              await AccountProfile.findOneAndUpdate(
+                { account_id: accountId },
+                {
+                  telegram_name: tgName || me.username || '',
+                  telegram_username: me.username || '',
+                  phone: me.phone || '',
+                  updated_at: new Date()
+                }
+              );
+            } catch (syncErr) {
+              console.warn("Failed to sync telegram info to AccountProfile:", syncErr);
+            }
           } catch (e: any) {
             console.error("Error getting user info for account:", accountId, e);
             if (e.message?.includes("AUTH_KEY_UNREGISTERED") || e.message?.includes("AUTH_KEY_DUPLICATED")) {
@@ -3372,6 +4500,196 @@ async function startServer() {
       console.error("Error in /api/stats:", err);
       await saveLog(err.message, 'error', 'API', '/api/stats');
       res.status(500).json({ error: `[GET /api/stats] ${err.message}` });
+    }
+  });
+
+  // Consolidated App State Endpoint - Single roundtrip to eliminate rate limits completely
+  app.get("/api/app-state", async (req, res) => {
+    try {
+      const accountId = getAccountId(req);
+      
+      const [
+        topicCount,
+        todayTopicCount,
+        todayPhotoSentStats,
+        past24hPhotoSentStats,
+        keywords,
+        blockedTopics,
+        missedCount,
+        logs,
+        accountsDoc,
+        activeDoc,
+        lastBatch
+      ] = await Promise.all([
+        getTopicCount(accountId).catch(() => 0),
+        getTodayTopicCount(accountId).catch(() => 0),
+        getTodayPhotoSentStats(accountId).catch(() => 0),
+        getPast24hPhotoSentStats(accountId).catch(() => 0),
+        Keyword.find(getAccountFilter(accountId)).lean().catch(() => []),
+        BlockedTopic.find(getAccountFilter(accountId)).sort({ created_at: -1 }).lean().catch(() => []),
+        MissedTrigger.countDocuments({ processed: false, ...getAccountFilter(accountId) }).catch(() => 0),
+        Log.find({}).sort({ timestamp: -1 }).limit(50).lean().catch(() => []),
+        AccountProfile.find().sort({ created_at: 1 }).lean().catch(() => []),
+        getSetting("active_account_id"),
+        ImportBatch.findOne(getAccountFilter(accountId)).sort({ imported_at: -1, _id: -1 }).lean().catch(() => null)
+      ]);
+
+      const appLogo = (await getSetting("app_logo", accountId))?.value || "";
+      const autoReply = (await getSetting("auto_reply", accountId))?.value || "";
+      const autoReply2Enabled = (await getSetting("auto_reply_2_enabled", accountId))?.value === "true";
+      const autoReply2 = (await getSetting("auto_reply_2", accountId))?.value || "";
+      const autoReply2Delay = parseInt((await getSetting("auto_reply_2_delay", accountId))?.value || "1", 10);
+      const delaySeconds = parseInt((await getSetting("delay_seconds", accountId))?.value || "0", 10);
+      const keywordDelaySeconds = parseInt((await getSetting("keyword_delay_seconds", accountId))?.value || "0", 10);
+      const isSystemPaused = (await getSetting("system_paused", accountId))?.value === "true";
+      const photoReplyEnabled = (await getSetting("photo_reply_enabled", accountId))?.value === "true";
+      const photoReplyMessage = (await getSetting("photo_reply_message", accountId))?.value || "ok wait";
+      const photoReplyMessage2Enabled = (await getSetting("photo_reply_message_2_enabled", accountId))?.value === "true";
+      const photoReplyMessage2 = (await getSetting("photo_reply_message_2", accountId))?.value || "second message";
+      const photoReplyMessage2StartTime = (await getSetting("photo_reply_message_2_start_time", accountId))?.value || "";
+      const photoReplyMessage2EndTime = (await getSetting("photo_reply_message_2_end_time", accountId))?.value || "";
+      const photoReplyMax = parseInt((await getSetting("photo_reply_max", accountId))?.value || "2", 10);
+      const notificationSoundEnabled = (await getSetting("notification_sound_enabled", accountId))?.value === "true";
+      const notificationSoundType = (await getSetting("notification_sound_type", accountId))?.value || "default";
+      const topicIcon = (await getSetting("topic_icon", accountId))?.value || "✅";
+      const topicRenameEmoji = (await getSetting("topic_rename_emoji", accountId))?.value || "🛑";
+      const topicRenameKeywords = (await getSetting("topic_rename_keywords", accountId))?.value || "";
+      const topicRenameMatchMode = (await getSetting("topic_rename_match_mode", accountId))?.value || "exact";
+      const autoResetKeywords = (await getSetting("auto_reset_keywords", accountId))?.value === "true";
+      const autoBlockKeywords = (await getSetting("auto_block_keywords", accountId))?.value || "";
+      const aiModeEnabled = (await getSetting("ai_mode_enabled", accountId))?.value === "true";
+      const aiPersona = (await getSetting("ai_persona", accountId))?.value || "";
+      const geminiApiKeys = (await getSetting("gemini_api_keys", accountId))?.value || "[]";
+      const replyInGeneral = (await getSetting("reply_in_general", accountId))?.value === "true";
+      const lastLoginTime = (await getSetting("last_login_time", accountId))?.value || "";
+      const targetGroupId = (await getSetting("telegram_group_ids", accountId))?.value || (accountId === 'default' ? process.env.TELEGRAM_GROUP_ID : "") || "";
+      
+      const session = accountClients.get(accountId);
+      const client = session?.client || (accountId === 'default' ? userClient : null);
+      let isUserBotConnected = !!client && (session ? true : cachedAuthStatus);
+
+      const apiId = (await getSetting("api_id", accountId))?.value || "";
+      const apiHash = (await getSetting("api_hash", accountId))?.value || "";
+      const defaultPhone = (await getSetting("default_phone", accountId))?.value || "";
+
+      let loginUser = session?.loginUser || null;
+
+      // Accounts formatting
+      let accountsList = accountsDoc || [];
+      if (!accountsList.some((a: any) => a.account_id === 'default')) {
+        accountsList = [{
+          account_id: 'default',
+          name: 'Main Account',
+          avatar_color: 'from-blue-600 to-indigo-600',
+          is_main: true
+        } as any, ...accountsList];
+      }
+      const activeAccountId = activeDoc?.value || 'default';
+      const enrichedAccounts = accountsList.map((acc: any) => {
+        const accSession = accountClients.get(acc.account_id);
+        const isClientActive = !!(accSession?.client || (acc.account_id === 'default' && userClient && cachedAuthStatus));
+        const liveUser = accSession?.loginUser;
+        return {
+          id: acc.account_id,
+          name: acc.name,
+          avatarColor: acc.avatar_color,
+          isMain: !!acc.is_main,
+          lockPin: acc.lock_pin || '',
+          phone: acc.phone || liveUser?.phone || '',
+          telegramName: acc.telegram_name || (liveUser ? [liveUser.firstName, liveUser.lastName].filter(Boolean).join(' ') : ''),
+          telegramUsername: acc.telegram_username || liveUser?.username || '',
+          isConnected: isClientActive,
+          createdAt: acc.created_at,
+          updatedAt: acc.updated_at,
+          isActive: acc.account_id === activeAccountId
+        };
+      });
+
+      // Last import info
+      const totalKeywords = keywords.length;
+      const latestKw = keywords.length > 0 ? keywords[keywords.length - 1] : null;
+      const latestRuleName = latestKw ? (latestKw.keyword || (latestKw.keywords && latestKw.keywords[0]) || 'Rule') : '';
+      let lastImportInfo: any = {
+        hasLastImport: false,
+        batchId: null,
+        importedAt: null,
+        count: 0,
+        names: [],
+        latestRuleName,
+        totalRules: totalKeywords
+      };
+      if (lastBatch) {
+        lastImportInfo = {
+          hasLastImport: true,
+          batchId: lastBatch.batch_id,
+          importedAt: lastBatch.imported_at,
+          count: lastBatch.count,
+          names: lastBatch.keyword_names ? lastBatch.keyword_names.slice(0, 10) : [],
+          latestRuleName,
+          totalRules: totalKeywords
+        };
+      }
+
+      const stats = {
+        topicCount,
+        appLogo,
+        todayTopicCount,
+        todayPhotoSentStats,
+        past24hPhotoSentStats,
+        keywordCount: keywords.length,
+        autoReply,
+        autoReply2Enabled,
+        autoReply2,
+        autoReply2Delay,
+        delaySeconds,
+        keywordDelaySeconds,
+        isSystemPaused,
+        photoReplyEnabled,
+        photoReplyMessage,
+        photoReplyMessage2Enabled,
+        photoReplyMessage2,
+        photoReplyMessage2StartTime,
+        photoReplyMessage2EndTime,
+        photoReplyMax,
+        notificationSoundEnabled,
+        notificationSoundType,
+        topicIcon,
+        topicRenameEmoji,
+        topicRenameKeywords,
+        topicRenameMatchMode,
+        autoResetKeywords,
+        autoBlockKeywords,
+        aiModeEnabled,
+        aiPersona,
+        geminiApiKeys,
+        replyInGeneral,
+        isUserBotConnected,
+        sessionStartTime: session?.sessionStartTime || sessionStartTime,
+        lastLoginTime,
+        apiId,
+        apiHash,
+        defaultPhone,
+        targetGroupId,
+        loginUser,
+        telegramBotToken: (await getSetting("telegram_bot_token", accountId))?.value || (accountId === 'default' ? process.env.TELEGRAM_BOT_TOKEN : "") || "",
+        botInfo: currentBotInfo,
+      };
+
+      res.json({
+        success: true,
+        stats,
+        keywords,
+        blockedTopics,
+        accounts: enrichedAccounts,
+        activeAccountId,
+        missedCount,
+        logs,
+        lastImportInfo,
+        serverTime: Date.now()
+      });
+    } catch (err: any) {
+      console.error("Error in /api/app-state:", err);
+      res.status(500).json({ error: `[GET /api/app-state] ${err.message}` });
     }
   });
 
@@ -3442,51 +4760,53 @@ async function startServer() {
         targetGroupId,
         telegramBotToken,
         globalApprovalMode, appLogo } = req.body;
-      if (typeof autoReply === "string") await setSetting("auto_reply", autoReply, accountId);
-      if (typeof autoReply2Enabled !== "undefined") await setSetting("auto_reply_2_enabled", String(autoReply2Enabled), accountId);
-      if (typeof autoReply2 === "string") await setSetting("auto_reply_2", autoReply2, accountId);
-      if (typeof autoReply2Delay !== "undefined") await setSetting("auto_reply_2_delay", String(autoReply2Delay), accountId);
-      if (typeof delaySeconds !== "undefined") await setSetting("delay_seconds", String(delaySeconds), accountId);
-      if (typeof keywordDelaySeconds !== "undefined") await setSetting("keyword_delay_seconds", String(keywordDelaySeconds), accountId);
-      if (typeof apiId !== "undefined") await setSetting("api_id", String(apiId), accountId);
-      if (typeof apiHash !== "undefined") await setSetting("api_hash", String(apiHash), accountId);
-      if (typeof systemPaused !== "undefined") await setSetting("system_paused", String(systemPaused), accountId);
-      if (typeof photoReplyEnabled !== "undefined") await setSetting("photo_reply_enabled", String(photoReplyEnabled), accountId);
-      if (typeof photoReplyMessage !== "undefined") await setSetting("photo_reply_message", String(photoReplyMessage), accountId);
-      if (typeof photoReplyMessage2Enabled !== "undefined") await setSetting("photo_reply_message_2_enabled", String(photoReplyMessage2Enabled), accountId);
-      if (typeof photoReplyMessage2 !== "undefined") await setSetting("photo_reply_message_2", String(photoReplyMessage2), accountId);
-      if (typeof photoReplyMax !== "undefined") await setSetting("photo_reply_max", String(photoReplyMax), accountId);
-      if (typeof notificationSoundEnabled !== "undefined") await setSetting("notification_sound_enabled", String(notificationSoundEnabled), accountId);
-      if (typeof notificationSoundType !== "undefined") await setSetting("notification_sound_type", String(notificationSoundType), accountId);
-      if (typeof topicIcon !== "undefined") await setSetting("topic_icon", String(topicIcon), accountId);
-      if (typeof topicRenameEmoji !== "undefined") await setSetting("topic_rename_emoji", String(topicRenameEmoji), accountId);
-      if (typeof topicRenameKeywords !== "undefined") await setSetting("topic_rename_keywords", String(topicRenameKeywords), accountId);
-      if (typeof topicRenameMatchMode !== "undefined") await setSetting("topic_rename_match_mode", String(topicRenameMatchMode), accountId);
-      if (typeof autoResetKeywords !== "undefined") await setSetting("auto_reset_keywords", String(autoResetKeywords), accountId);
-      if (typeof autoBlockKeywords !== "undefined") await setSetting("auto_block_keywords", String(autoBlockKeywords), accountId);
-      if (typeof aiModeEnabled !== "undefined") await setSetting("ai_mode_enabled", String(aiModeEnabled), accountId);
-      if (typeof aiPersona !== "undefined") await setSetting("ai_persona", String(aiPersona), accountId);
-      if (typeof geminiApiKeys !== "undefined") await setSetting("gemini_api_keys", String(geminiApiKeys), accountId);
-      if (typeof replyInGeneral !== "undefined") await setSetting("reply_in_general", String(replyInGeneral), accountId);
-      if (typeof photoReplyMessage2StartTime === "string") await setSetting("photo_reply_message_2_start_time", photoReplyMessage2StartTime, accountId);
-      if (typeof photoReplyMessage2EndTime === "string") await setSetting("photo_reply_message_2_end_time", photoReplyMessage2EndTime, accountId);
-      if (typeof targetGroupId !== "undefined") await setSetting("telegram_group_ids", String(targetGroupId), accountId);
-      if (typeof globalApprovalMode !== "undefined") await setSetting("global_approval_mode", String(globalApprovalMode), accountId);
+      const promises: Promise<any>[] = [];
+      if (typeof autoReply === "string") promises.push(setSetting("auto_reply", autoReply, accountId));
+      if (typeof autoReply2Enabled !== "undefined") promises.push(setSetting("auto_reply_2_enabled", String(autoReply2Enabled), accountId));
+      if (typeof autoReply2 === "string") promises.push(setSetting("auto_reply_2", autoReply2, accountId));
+      if (typeof autoReply2Delay !== "undefined") promises.push(setSetting("auto_reply_2_delay", String(autoReply2Delay), accountId));
+      if (typeof delaySeconds !== "undefined") promises.push(setSetting("delay_seconds", String(delaySeconds), accountId));
+      if (typeof keywordDelaySeconds !== "undefined") promises.push(setSetting("keyword_delay_seconds", String(keywordDelaySeconds), accountId));
+      if (typeof apiId !== "undefined") promises.push(setSetting("api_id", String(apiId), accountId));
+      if (typeof apiHash !== "undefined") promises.push(setSetting("api_hash", String(apiHash), accountId));
+      if (typeof systemPaused !== "undefined") promises.push(setSetting("system_paused", String(systemPaused), accountId));
+      if (typeof photoReplyEnabled !== "undefined") promises.push(setSetting("photo_reply_enabled", String(photoReplyEnabled), accountId));
+      if (typeof photoReplyMessage !== "undefined") promises.push(setSetting("photo_reply_message", String(photoReplyMessage), accountId));
+      if (typeof photoReplyMessage2Enabled !== "undefined") promises.push(setSetting("photo_reply_message_2_enabled", String(photoReplyMessage2Enabled), accountId));
+      if (typeof photoReplyMessage2 !== "undefined") promises.push(setSetting("photo_reply_message_2", String(photoReplyMessage2), accountId));
+      if (typeof photoReplyMax !== "undefined") promises.push(setSetting("photo_reply_max", String(photoReplyMax), accountId));
+      if (typeof notificationSoundEnabled !== "undefined") promises.push(setSetting("notification_sound_enabled", String(notificationSoundEnabled), accountId));
+      if (typeof notificationSoundType !== "undefined") promises.push(setSetting("notification_sound_type", String(notificationSoundType), accountId));
+      if (typeof topicIcon !== "undefined") promises.push(setSetting("topic_icon", String(topicIcon), accountId));
+      if (typeof topicRenameEmoji !== "undefined") promises.push(setSetting("topic_rename_emoji", String(topicRenameEmoji), accountId));
+      if (typeof topicRenameKeywords !== "undefined") promises.push(setSetting("topic_rename_keywords", String(topicRenameKeywords), accountId));
+      if (typeof topicRenameMatchMode !== "undefined") promises.push(setSetting("topic_rename_match_mode", String(topicRenameMatchMode), accountId));
+      if (typeof autoResetKeywords !== "undefined") promises.push(setSetting("auto_reset_keywords", String(autoResetKeywords), accountId));
+      if (typeof autoBlockKeywords !== "undefined") promises.push(setSetting("auto_block_keywords", String(autoBlockKeywords), accountId));
+      if (typeof aiModeEnabled !== "undefined") promises.push(setSetting("ai_mode_enabled", String(aiModeEnabled), accountId));
+      if (typeof aiPersona !== "undefined") promises.push(setSetting("ai_persona", String(aiPersona), accountId));
+      if (typeof geminiApiKeys !== "undefined") promises.push(setSetting("gemini_api_keys", String(geminiApiKeys), accountId));
+      if (typeof replyInGeneral !== "undefined") promises.push(setSetting("reply_in_general", String(replyInGeneral), accountId));
+      if (typeof photoReplyMessage2StartTime === "string") promises.push(setSetting("photo_reply_message_2_start_time", photoReplyMessage2StartTime, accountId));
+      if (typeof photoReplyMessage2EndTime === "string") promises.push(setSetting("photo_reply_message_2_end_time", photoReplyMessage2EndTime, accountId));
+      if (typeof targetGroupId !== "undefined") promises.push(setSetting("telegram_group_ids", String(targetGroupId), accountId));
+      if (typeof globalApprovalMode !== "undefined") promises.push(setSetting("global_approval_mode", String(globalApprovalMode), accountId));
       if (typeof appLogo !== "undefined") {
-        await setSetting("app_logo", String(appLogo), accountId);
+        promises.push(setSetting("app_logo", String(appLogo), accountId));
         if (accountId !== "default") {
-          await setSetting("app_logo", String(appLogo), "default");
+          promises.push(setSetting("app_logo", String(appLogo), "default"));
         }
       }
       
       if (typeof telegramBotToken !== "undefined") {
         const oldToken = (await getSetting("telegram_bot_token", accountId))?.value;
         if (telegramBotToken && telegramBotToken !== oldToken) {
-          await setSetting("telegram_bot_token", telegramBotToken, accountId);
+          promises.push(setSetting("telegram_bot_token", telegramBotToken, accountId));
           console.log("Telegram Bot Token updated. Restarting bot...");
         }
       }
       
+      await Promise.all(promises);
       await refreshSettingsCache();
 
       if (typeof telegramBotToken !== "undefined") {
@@ -3776,47 +5096,238 @@ async function startServer() {
       const accountId = getAccountId(req);
       const keywords = await Keyword.find(getAccountFilter(accountId));
       const settings = await Setting.find({ key: { $ne: "session_string" }, ...getAccountFilter(accountId) }); // Don't export session string
-      res.json({ keywords, settings });
+      const blockedTopics = await BlockedTopic.find(getAccountFilter(accountId));
+      const topics = await Topic.find(getAccountFilter(accountId));
+      const accountProfiles = await AccountProfile.find(getAccountFilter(accountId));
+      res.json({ keywords, settings, blockedTopics, topics, accountProfiles });
     } catch (err: any) {
       res.status(500).json({ error: `[GET /api/data/export] ${err.message}` });
     }
   });
 
-  app.post("/api/data/import", express.json({ limit: '10mb' }), async (req, res) => {
+  app.post("/api/data/import", express.json({ limit: '25mb' }), async (req, res) => {
     try {
       const accountId = getAccountId(req);
-      const { keywords, settings } = req.body;
-      
-      if (keywords && Array.isArray(keywords)) {
-        for (const kw of keywords) {
-          await Keyword.findOneAndUpdate(
-            { keyword: kw.keyword, ...getAccountFilter(accountId) },
-            { 
-              keywords: kw.keywords || [kw.keyword],
-              reply: kw.reply, 
-              photo: kw.photo, 
-              message_link: kw.message_link,
-              message_links: kw.message_links || [],
-              max_replies: kw.max_replies !== undefined ? kw.max_replies : 0,
-              match_mode: kw.match_mode || 'exact',
-              account_id: accountId || 'default'
-            },
-            { upsert: true }
-          );
+      let keywordsList: any[] = [];
+      let settingsList: any[] = [];
+      let blockedTopicsList: any[] = [];
+      let topicsList: any[] = [];
+      let accountProfilesList: any[] = [];
+
+      if (Array.isArray(req.body)) {
+        keywordsList = req.body;
+      } else if (req.body && typeof req.body === 'object') {
+        if (Array.isArray(req.body.keywords)) {
+          keywordsList = req.body.keywords;
+        } else if (Array.isArray(req.body.rules)) {
+          keywordsList = req.body.rules;
+        } else if (Array.isArray(req.body.data)) {
+          keywordsList = req.body.data;
+        } else if (Array.isArray(req.body.items)) {
+          keywordsList = req.body.items;
+        } else if (Array.isArray(req.body.list)) {
+          keywordsList = req.body.list;
+        }
+
+        if (Array.isArray(req.body.settings)) {
+          settingsList = req.body.settings;
+        }
+        if (Array.isArray(req.body.blockedTopics)) {
+          blockedTopicsList = req.body.blockedTopics;
+        } else if (Array.isArray(req.body.blocked_topics)) {
+          blockedTopicsList = req.body.blocked_topics;
+        }
+        if (Array.isArray(req.body.topics)) {
+          topicsList = req.body.topics;
+        }
+        if (Array.isArray(req.body.accountProfiles)) {
+          accountProfilesList = req.body.accountProfiles;
+        } else if (Array.isArray(req.body.account_profiles)) {
+          accountProfilesList = req.body.account_profiles;
         }
       }
 
-      if (settings && Array.isArray(settings)) {
-        for (const s of settings) {
-          if (s.key !== "session_string") {
+      const areArraysEqual = (a: any[], b: any[]) => {
+        if (!a || !b) return a === b;
+        if (a.length !== b.length) return false;
+        const sortedA = [...a].sort();
+        const sortedB = [...b].sort();
+        return sortedA.every((val, index) => val === sortedB[index]);
+      };
+
+      const batchId = `batch_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+      const importedKeywordIds: any[] = [];
+      const importedKeywordNames: string[] = [];
+
+      if (keywordsList && keywordsList.length > 0) {
+        for (const kw of keywordsList) {
+          if (!kw || typeof kw !== 'object') continue;
+          const kwIdentifier = kw.keyword || (kw.keywords && kw.keywords[0]) || '';
+          const matchQuery: any = { ...getAccountFilter(accountId) };
+          if (kwIdentifier) {
+            matchQuery.$or = [
+              { keyword: kwIdentifier },
+              ...(kw.keywords && kw.keywords.length > 0 ? [{ keywords: { $in: kw.keywords } }] : [])
+            ];
+          } else if (kw._id) {
+            matchQuery._id = kw._id;
+          }
+
+          // Smart Duplicate Check: Skip if the exact same rule already exists
+          const existingKw = await Keyword.findOne(matchQuery);
+          if (existingKw) {
+            const keywordsSame = areArraysEqual(existingKw.keywords || [], kw.keywords || (kw.keyword ? [kw.keyword] : []));
+            const targetGroupsSame = areArraysEqual(existingKw.target_groups || [], kw.target_groups || []);
+            const messageLinksSame = areArraysEqual(existingKw.message_links || [], kw.message_links || []);
+            
+            const isSame = 
+              existingKw.keyword === kwIdentifier &&
+              keywordsSame &&
+              (existingKw.reply || '') === (kw.reply || '') &&
+              (existingKw.photo || '') === (kw.photo || '') &&
+              (existingKw.message_link || '') === (kw.message_link || '') &&
+              (existingKw.match_mode || 'exact') === (kw.match_mode || 'exact') &&
+              (existingKw.max_replies !== undefined ? existingKw.max_replies : 2) === (kw.max_replies !== undefined ? kw.max_replies : 2) &&
+              !!existingKw.ai_reply_enabled === !!kw.ai_reply_enabled &&
+              !!existingKw.approval_mode === !!kw.approval_mode &&
+              !!existingKw.notify_on_hit === !!kw.notify_on_hit &&
+              (existingKw.enabled !== undefined ? existingKw.enabled : true) === (kw.enabled !== undefined ? kw.enabled : true) &&
+              targetGroupsSame &&
+              messageLinksSame;
+
+            if (isSame) {
+              // Exact match found - skip writing to database for efficiency and zero duplication
+              continue;
+            }
+          }
+
+          const doc = await Keyword.findOneAndUpdate(
+            matchQuery,
+            { 
+              keyword: kwIdentifier,
+              keywords: kw.keywords || (kw.keyword ? [kw.keyword] : []),
+              reply: kw.reply || '', 
+              photo: kw.photo || '', 
+              message_link: kw.message_link || '',
+              message_links: kw.message_links || [],
+              max_replies: kw.max_replies !== undefined ? kw.max_replies : 2,
+              match_mode: kw.match_mode || 'exact',
+              ai_reply_enabled: !!kw.ai_reply_enabled,
+              approval_mode: !!kw.approval_mode,
+              notify_on_hit: !!kw.notify_on_hit,
+              target_groups: kw.target_groups || [],
+              enabled: kw.enabled !== undefined ? kw.enabled : true,
+              last_import_batch_id: batchId,
+              account_id: accountId || 'default'
+            },
+            { upsert: true, new: true }
+          );
+
+          if (doc) {
+            importedKeywordIds.push(doc._id);
+            importedKeywordNames.push(kwIdentifier || (kw.keywords && kw.keywords.join(', ')) || 'Rule');
+          }
+        }
+      }
+
+      if (settingsList && settingsList.length > 0) {
+        for (const s of settingsList) {
+          if (s.key && s.key !== "session_string") {
+            const currentSetting = await getSetting(s.key, accountId);
+            if (currentSetting && currentSetting.value === s.value) {
+              // Value is identical - skip update to avoid redundant writes
+              continue;
+            }
             await setSetting(s.key, s.value, accountId);
           }
         }
       }
 
+      if (blockedTopicsList && blockedTopicsList.length > 0) {
+        for (const bt of blockedTopicsList) {
+          if (bt.telegram_topic_id) {
+            const existingBt = await BlockedTopic.findOne({ telegram_topic_id: bt.telegram_topic_id, ...getAccountFilter(accountId) });
+            if (existingBt && existingBt.name === bt.name && existingBt.link === bt.link) {
+              // Identical - skip
+              continue;
+            }
+            await BlockedTopic.findOneAndUpdate(
+              { telegram_topic_id: bt.telegram_topic_id, ...getAccountFilter(accountId) },
+              { name: bt.name || '', link: bt.link || '', account_id: accountId || 'default' },
+              { upsert: true }
+            );
+            addBlockedTopicToCache(bt.telegram_topic_id, accountId);
+          }
+        }
+      }
+
+      if (topicsList && topicsList.length > 0) {
+        for (const t of topicsList) {
+          if (t.telegram_topic_id) {
+            const existingT = await Topic.findOne({ telegram_topic_id: t.telegram_topic_id, ...getAccountFilter(accountId) });
+            if (existingT && existingT.name === t.name && existingT.chat_id === t.chat_id) {
+              // Identical - skip
+              continue;
+            }
+            await Topic.findOneAndUpdate(
+              { telegram_topic_id: t.telegram_topic_id, ...getAccountFilter(accountId) },
+              { name: t.name || '', chat_id: t.chat_id || '', account_id: accountId || 'default' },
+              { upsert: true }
+            );
+          }
+        }
+      }
+
+      if (accountProfilesList && accountProfilesList.length > 0) {
+        for (const ap of accountProfilesList) {
+          if (ap.account_id) {
+            const existingAp = await AccountProfile.findOne({ account_id: ap.account_id });
+            if (existingAp && 
+                existingAp.name === ap.name && 
+                existingAp.phone === ap.phone && 
+                existingAp.avatar_color === ap.avatar_color && 
+                existingAp.is_main === ap.is_main && 
+                existingAp.telegram_name === ap.telegram_name && 
+                existingAp.telegram_username === ap.telegram_username) {
+              // Identical - skip
+              continue;
+            }
+            await AccountProfile.findOneAndUpdate(
+              { account_id: ap.account_id },
+              { 
+                name: ap.name || 'Account', 
+                phone: ap.phone || '', 
+                avatar_color: ap.avatar_color || 'from-blue-600 to-indigo-600', 
+                is_main: !!ap.is_main,
+                telegram_name: ap.telegram_name || '',
+                telegram_username: ap.telegram_username || ''
+              },
+              { upsert: true }
+            );
+          }
+        }
+      }
+
+      const rawFileName = req.body?.fileName || req.query?.fileName || '';
+      const fallbackName = `Import_${new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}`;
+      const fileNameToStore = typeof rawFileName === 'string' && rawFileName.trim() ? rawFileName.trim() : fallbackName;
+
+      if (importedKeywordIds.length > 0 || settingsList.length > 0 || blockedTopicsList.length > 0) {
+        await ImportBatch.create({
+          account_id: accountId || 'default',
+          batch_id: batchId,
+          file_name: fileNameToStore,
+          imported_at: new Date(),
+          keyword_ids: importedKeywordIds,
+          keyword_names: importedKeywordNames,
+          count: importedKeywordIds.length + settingsList.length + blockedTopicsList.length
+        });
+      }
+
       await refreshKeywordCache();
-      await saveLog("Data imported", 'info', 'API', '/api/data/import', undefined, accountId);
-      res.json({ success: true });
+      await refreshSettingsCache();
+      await saveLog(`Imported complete backup data (${importedKeywordIds.length} rules, ${settingsList.length} settings, ${blockedTopicsList.length} blocked topics)`, 'info', 'API', '/api/data/import', undefined, accountId);
+      res.json({ success: true, count: importedKeywordIds.length, batchId });
     } catch (err: any) {
       res.status(500).json({ error: `[POST /api/data/import] ${err.message}` });
     }
@@ -4707,8 +6218,7 @@ async function startServer() {
 
   app.get("/api/logs", async (req, res) => {
     try {
-      const accountId = getAccountId(req);
-      const logs = await Log.find(getAccountFilter(accountId)).sort({ timestamp: -1 }).limit(100);
+      const logs = await Log.find({}).sort({ timestamp: -1 }).limit(100);
       res.json(logs);
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -4806,8 +6316,7 @@ async function startServer() {
 
   app.get("/api/logs/export", async (req, res) => {
     try {
-      const accountId = getAccountId(req);
-      const logs = await Log.find(getAccountFilter(accountId)).sort({ timestamp: -1 });
+      const logs = await Log.find({}).sort({ timestamp: -1 });
       const format = req.query.format || 'json';
       
       if (format === 'csv') {
@@ -4965,6 +6474,99 @@ async function startServer() {
 
       res.json({ keywordData, topicData, topicCreationData });
     } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get("/api/gemini/suggest-keywords", async (req, res) => {
+    try {
+      const accountId = getAccountId(req);
+      
+      // 1. Fetch recent 50 USERBOT log messages for analysis
+      const recentLogs = await Log.find({
+        account_id: accountId || 'default',
+        category: 'USERBOT'
+      }).sort({ timestamp: -1 }).limit(50);
+
+      const logTexts = recentLogs.map(l => l.message).filter(Boolean);
+
+      // Creative exam study materials fallback context
+      const fallbackContext = [
+        "SSC CGL Maths batch by Gagan Pratap link leak free",
+        "How do I pay 87rs for railway batch",
+        "English volume 1 Neetu Singh class notes",
+        "Do you have SSC CHSL free mock test leak",
+        "UPI payment scanner study material",
+        "Abhinay Sharma maths live batch leak 87rs",
+        "Current affairs PDF study material prep",
+        "GS leak GK notes history question bank"
+      ];
+
+      const analysisInput = logTexts.length > 0 ? logTexts.join("\n") : fallbackContext.join("\n");
+
+      // 2. Fetch keys
+      const geminiApiKeysSetting = await getSetting("gemini_api_keys", accountId);
+      let apiKeys: string[] = [];
+      try {
+        apiKeys = JSON.parse(geminiApiKeysSetting?.value || "[]");
+      } catch (e) {}
+
+      const envKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
+      if (envKey && !apiKeys.includes(envKey)) {
+        apiKeys.push(envKey);
+      }
+
+      if (apiKeys.length === 0) {
+        return res.status(400).json({ error: "Please configure a Gemini API key in settings first." });
+      }
+
+      const activeKey = apiKeys[0];
+      const genAI = new GoogleGenAI({ apiKey: activeKey });
+
+      const response = await genAI.models.generateContent({
+        model: "gemini-3.8-flash",
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                text: `Analyze the recent Telegram message notifications and log triggers:\n\n${analysisInput}\n\nSuggest exactly 4 smart automated keyword rules that this Telegram store bot should register to answer queries instantly. 
+For each suggested rule, provide:
+1. keyword: A short primary trigger word (e.g., 'maths', 'discount', 'payment').
+2. keywords: An array of synonyms or closely matching keyword triggers (e.g. ['gagan math', 'math batch', 'abhinay math']).
+3. reply: A helpful, informative, and polite automatic reply answering the query. Mention that study batches are 87rs each or provide clear instructions.
+4. category: A short category name (e.g., 'Payment Help', 'Study Material', 'Course Query', 'Greeting').
+5. explanation: A one-sentence explanation of why this keyword rule is suggested based on the analyzed user chat trends.`
+              }
+            ]
+          }
+        ],
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                keyword: { type: Type.STRING },
+                keywords: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING }
+                },
+                reply: { type: Type.STRING },
+                category: { type: Type.STRING },
+                explanation: { type: Type.STRING }
+              },
+              required: ["keyword", "keywords", "reply", "category", "explanation"]
+            }
+          }
+        }
+      });
+
+      const parsed = JSON.parse(response.text.trim());
+      res.json({ suggestions: parsed });
+    } catch (err: any) {
+      console.error("Gemini Suggest Keywords error:", err);
       res.status(500).json({ error: err.message });
     }
   });

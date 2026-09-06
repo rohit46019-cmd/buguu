@@ -1,4 +1,4 @@
-import React, { useState, useEffect, memo } from 'react';
+import React, { useState, useEffect, useRef, memo } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import toast from 'react-hot-toast';
 import { Plus, X, Hash, Link, Trash2, Sparkles, Zap, MessageSquare, Users, Check, Bell, ShieldCheck, ChevronDown, ChevronUp, Copy } from 'lucide-react';
@@ -113,7 +113,15 @@ const AddKeywordSection: React.FC<AddKeywordSectionProps> = ({
     return idOrTitle;
   };
 
+  const prevEditingIdRef = useRef<string | null | undefined>(undefined);
+
   useEffect(() => {
+    const currentId = editingKeyword ? editingKeyword._id : null;
+    if (prevEditingIdRef.current === currentId) {
+      return; // Do not reset if ID has not changed (e.g., background polling refresh)
+    }
+    prevEditingIdRef.current = currentId;
+
     if (editingKeyword) {
       setIsExpanded(true);
       const kws = editingKeyword.keywords && editingKeyword.keywords.length > 0 
